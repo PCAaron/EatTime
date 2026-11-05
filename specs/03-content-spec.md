@@ -223,8 +223,32 @@ FoodItem 表示一个标准食材。
 | `status`           | string   | 是   | 食材状态       |
 | `sourceReferences` | array    | 否   | 数据来源       |
 | `reviewStatus`     | string   | 是   | 审核状态       |
+| `reviewedBy`       | string   | 否   | 最近一次**发布审核**通过的操作者 ID；随实体发布写入 |
+| `reviewedAt`       | datetime | 否   | 最近一次发布审核通过时间 |
+| `version`          | string   | 是   | 内容版本号（与 `ContentVersion` 或发布快照一致，见 §4.2.1） |
 | `createdAt`        | datetime | 是   | 创建时间       |
 | `updatedAt`        | datetime | 是   | 更新时间       |
+
+### 4.2.1 别名与实体级审核（F-04.3-05）
+
+**审核粒度**：`FoodItem.aliases[]` 与 `FoodAllergen.aliases[]` 采用**实体级**审核，不对单个别名单独维护审核状态。
+
+**责任边界**：
+
+| 实体 | 别名维护 | 发布审核 |
+| --- | --- | --- |
+| `FoodItem` | 内容运营/专业人员 | 与 `FoodItem.status` / `reviewStatus` 同一发布流程 |
+| `FoodAllergen` | 内容运营/专业人员 | 与字典项 `status` / `reviewStatus` 同一发布流程 |
+
+**生命周期**：
+
+1. 新增或修改 `aliases[]` 后，实体须进入 `pending_review`（或保持不可发布状态），直至再次审核发布。
+2. **仅当** `FoodItem.status=published` 且 `reviewStatus` 为 `approved`/`published` 时，当前 `aliases[]` 整包视为已审核，可参与 S1 自动匹配（05 §5.3.2.4）。
+3. 审核未通过或仍为草稿的 `aliases` **不得**参与 `matched` / `not_matched`。
+4. 别名撤销或修改并重新发布后，`reviewedBy`、`reviewedAt`、`version` 更新；历史匹配追溯依赖任务/日程生成时点的内容版本快照，而非 retroactive 改写。
+5. **不**新建独立别名集合；审计复用 `ContentVersion` 与实体 `version` 字段。
+
+**与 05 对齐**：字段名 `reviewedBy`、`reviewedAt`、`version` 语义与 05 §5.4、`§5.3.2.4` 一致。
 
 ### 4.3 食材分类
 
@@ -250,32 +274,34 @@ FoodItem 表示一个标准食材。
 - 同一食材原则上应有一个主要分类。
 - 不应仅根据食材名称推断营养属性或安全属性。
 
-### 4.4 食材过敏原标签
+### 4.4 过敏原字典（FoodAllergen）
 
-`allergenCodes` 用于标记食材关联的已审核过敏原类别。
+持久化实体 `FoodAllergen`，集合 `food_allergens`（02 §7.0、05 §5.4）。`FoodItem.allergenCodes` 为内容侧分类标签，**不能**替代已审核的 `FoodSafetyProfile.allergenIds` 用于 S1 门禁（05 §5.3.2.1）。
 
-建议采用标准字典，而不是直接将过敏原名称写死在代码中。
+**字典项字段**（与 02/05 一致）：
 
-每个过敏原字典项至少包含：
+| 字段               | 类型     | 必填 | 说明       |
+| ------------------ | -------- | ---- | ---------- |
+| `_id` / `allergenId` | string | 是   | 过敏原 ID  |
+| `allergenCode`     | string   | 是   | 统一编码   |
+| `allergenName`     | string   | 是   | 标准名称   |
+| `aliases`          | array    | 否   | 别名（实体级审核，见 §4.2.1） |
+| `description`      | string   | 否   | 说明       |
+| `sourceReferences` | array    | 否   | 来源依据   |
+| `relatedFoodItems` | array    | 否   | 关联食材 ID（须与已审核 `FoodSafetyProfile` 一致，不得仅名称推断） |
+| `status`           | string   | 是   | `active` / `inactive` |
+| `reviewStatus`     | string   | 是   | 内容审核状态（同 §4.5 枚举语义） |
+| `reviewedBy`       | string   | 否   | 最近一次发布审核操作者 |
+| `reviewedAt`       | datetime | 否   | 最近一次发布审核时间 |
+| `version`          | string   | 是   | 字典版本号 |
 
-| 字段               | 类型   | 说明       |
-| ------------------ | ------ | ---------- |
-| `code`             | string | 过敏原编码 |
-| `name`             | string | 标准名称   |
-| `aliases`          | array  | 别名       |
-| `description`      | string | 说明       |
-| `sourceReferences` | array  | 来源依据   |
-| `reviewStatus`     | string | 审核状态   |
-| `version`          | string | 字典版本   |
+**名称与映射（F-04.3-03）**：
 
-重要约束：
+1. 用户自由输入的名称 **不得** 自动写入 `aliases`。
+2. 无法映射到唯一已发布 `FoodItem` 或 `FoodAllergen` 的用户输入，在 S1 中按 05 §5.3.2.5 返回 `unresolved`。
+3. 复合食品须维护可展开的结构化成分（Recipe / `RecipeIngredient`）；成分不完整时 **不得** 作为完整安全数据参与 `not_matched`。
 
-1. 过敏原标签必须有明确依据。
-2. 不得仅通过文本关键词匹配认定食材过敏原属性。
-3. 食材与过敏原之间的关联需要经过审核。
-4. 未确认的信息不能默认标记为无过敏原。
-5. 用户声明的已知过敏食物应优先于普通内容标签执行过滤。
-6. 复合食品及加工食品需要考虑其配料信息和交叉接触风险，具体规则由安全规则 Spec 定义。
+**食材 `allergenCodes`（`FoodItem`）**：须有依据并经审核；不得仅关键词认定；未确认不得默认无过敏原；与 `FoodSafetyProfile.allergenIds` 的 S1 职责区分见 §4.5 末及 05 §5.3.2.1。
 
 ### 4.5 食材状态
 
@@ -289,6 +315,8 @@ FoodItem 表示一个标准食材。
 - `archived`：已归档。
 
 未发布或已撤回的食材，不得作为新发布食谱的有效食材引用。
+
+**`allergenCodes`（内容标签）**：可引用 §4.4 字典编码，用于展示与内容检索；S1 硬过滤以 `FoodSafetyProfile` 已审核关联为准（05 §5.3.2.1）。
 
 ---
 

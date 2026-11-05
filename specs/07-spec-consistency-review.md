@@ -858,7 +858,7 @@ Agent 必须：
 | --- | --- | --- | --- | --- |
 | F-02 | 内容状态枚举及生命周期 | 枚举：02 §5.1.1；迁移与推荐池：03 §12 | RESOLVED | PRD 改为引用；统一 `pending_review`；`expired` 为动态条件非主 status |
 | F-03 | 日程逻辑实体与持久化映射 | 02 §6.0；04 §3.1.1；06 §10.1.0 | RESOLVED | Plan/Day/Slot 非持久化；`ScheduleTask` 增加 `slotCode`；`schedules`↔`ScheduleInstance` |
-| F-04 | 过敏安全双模型 | 02 §7.0—§7.2；05 §5.2—5.3；06 §10.1.0 | **PARTIAL** | 持久化单模型已收口；F-04.1 已拆分 `status`/`reviewStatus` 并补全字段映射；**待独立复核**见 §15.3；`restrictionType` 类别级仍为待决策 |
+| F-04 | 过敏安全双模型 | 02 §7.0—§7.2；05 §5.2—5.3；06 §10.1.0 | **PARTIAL** | 持久化单模型已收口；F-04.1/F-04.2/F-04.3 已补匹配确定性与解除审计；**待独立复核**见 §15.3（已更新）；`restrictionType` 类别级仍为待决策 |
 
 ### 15.1 修复后检查矩阵（F-02—F-04）
 
@@ -874,10 +874,11 @@ Agent 必须：
 | 05 AllergyRestriction 与 02 字段映射完整 | §7.2 逐字段 + `declarationType`/`reviewStatus` | — | — | PASS |
 | S1 硬过滤不依赖 `reviewStatus` | `status=active` 唯一开关；02 §7.2、05 §5.3.1 | — | — | PASS |
 | S1 不依赖 `allergyStatus` | active `AllergyItem` 全状态硬过滤；02 §7.0.1、04 §9.2—9.3、05 §5.3.1 | — | — | PASS（F-04.2） |
-| `foodName` 确定性匹配 | 05 §5.3.2；`unresolved` 不得放行 | — | — | PASS（F-04.2） |
-| 审核拒绝不自动解除 | 02 §7.2、§7.4；05 §5.3.3 | — | — | PASS（F-04.2） |
+| `foodName` 确定性匹配 | 05 §5.3.2—5.3.2.6；`not_matched` 须 §5.3.2.1 门禁；`unresolved` 不得放行 | — | — | PASS（F-04.2 / F-04.3） |
+| 审核拒绝不自动解除 | 02 §7.2、§7.4；05 §5.3.3 | — | — | PASS（F-04.2 / F-04.3-07） |
+| `AllergyChangeLog` 跨 02/06 映射 | 02 §7.0、§7.4、§11；06 §10.1.0、§10.1、§8.4、§16.3 | — | — | PASS（F-04.3-06） |
 | `restrictionType` 类别级 V1 范围 | 不得伪装为已支持；02 `DECISION_REQUIRED` | — | — | PARTIAL |
-| 06 过敏集合与 02 一致 | 无第二套档案集合（`allergy_profiles` 仅废弃说明） | — | — | PASS |
+| 06 过敏集合与 02 一致 | 含 `allergy_change_logs`；无第二套档案集合 | — | — | PASS（F-04.3-06） |
 | 任务状态 blocked/expired 与 02 对齐 | statusReason 映射 | — | PASS | — |
 
 关联未本轮处理：F-07（06 全量集合与 02 逐一对账）。
@@ -896,7 +897,7 @@ Agent 必须：
 
 ### 15.3 F-04 独立复核记录（过敏安全数据模型收口）
 
-复核方法：人工重读 02 §2.2—§2.3、§7.0—§7.2、§10.4、§11；05 §5.2—5.3.1、§7.3；06 §10.1.0；全文检索 `AllergyProfile`、`allergy_profiles`、`AllergyRestriction`、`pending_review`（`AllergyItem.status` 语境）、`reviewStatus`、`domain`（档案字段语境）、`knownAllergies` / `observations`（持久化语境）。**未**将「文档曾标记 RESOLVED」视为通过依据；**F-04.1 文档修订后须重新执行本表复核**。
+复核方法：人工重读 02 §2.2—§2.3、§7.0—§7.2、§7.4、§10.4、§11；05 §5.2—5.3.3、§7.3；06 §10.1.0、§8.4；全文检索 `AllergyProfile`、`allergy_profiles`、`AllergyRestriction`、`pending_review`（`AllergyItem.status` 语境）、`reviewStatus`、`domain`（档案字段语境）、`knownAllergies` / `observations`（持久化语境）。**未**将「文档曾标记 RESOLVED」视为通过依据。F-04.1 修订与 F-04.2/F-04.3 定点修复后，本表已于 **2026-11-05** 更新（见 §15.4—15.5）。
 
 | 子项 | 结论 | 文档证据 |
 | --- | --- | --- |
@@ -906,11 +907,11 @@ Agent 必须：
 | F-04-D `UserSafetyProfile` 字段 | PASS | 02 §7.0.1 与 05 §5.2 字段名一致；投影单独标注 |
 | F-04-E `AllergyRestriction` 字段映射 | PASS | 02 §7.2 与 05 §5.3 逐字段一致；`declarationType`/`source`/`foodName`/`reviewStatus` 已映射 |
 | F-04-F `restrictionType` 类别级 V1 | PARTIAL | 02 §7.2、`05 §5.3`：`DECISION_REQUIRED`；V1 仅食物级，不得伪装为已支持 |
-| F-04-G S1 与 `pending_review` 语义 | PASS（待复核） | 02 §7.2：`status`/`reviewStatus` 拆分；05 §5.3.1：S1 仅读 `status=active`；旧 `status=pending_review` 迁移说明 |
-| F-04-H 06 集合映射 | PASS | 06 §10.1.0 与 02 §11 一致；`allergy_profiles` 仅废弃说明 |
+| F-04-G S1 与 `pending_review` 语义 | PASS | 02 §7.2：`status`/`reviewStatus` 拆分；05 §5.3.1：S1 仅读 `status=active`；旧 `status=pending_review` 迁移说明 |
+| F-04-H 06 集合映射 | PASS | 06 §10.1.0、§10.1 与 02 §11 一致；含 `allergy_change_logs`（F-04.3-06）；`allergy_profiles` 仅废弃说明 |
 | F-04-I 07 审查状态自洽 | PASS | 本表、§15 主表、§15.1 矩阵 F-04 列结论一致 |
 
-**F-04 总判定**：`PARTIAL PASS` — 持久化单模型、S1 语义与字段映射已在 Spec 闭环；**尚未**经 F-04.1 修订后的独立全文复核；剩余 **`AllergyRestriction.restrictionType` 食材类别级**若一期需要独立存储，需产品确认是否扩展 `AllergyItem` 或另规实体（当前 V1 以食物项为主）。
+**F-04 总判定**：`PARTIAL PASS` — 持久化单模型、S1 语义、字段映射、匹配确定性与解除审计已在 Spec 闭环（F-04.1—F-04.3）；**尚未**经实现层或集成测试验证；剩余 **`AllergyRestriction.restrictionType` 食材类别级**若一期需要独立存储，需产品确认是否扩展 `AllergyItem` 或另规实体（当前 V1 以食物项为主）。
 
 **F-04.1 修订摘要（2026-11-05）**：新增 `AllergyItem.reviewStatus`；`status` 仅 `active`/`inactive`；05 新增 §5.3.1 S1 硬过滤读取规则。
 
@@ -929,3 +930,22 @@ Agent 必须：
 **与 F-04 / F-04.1 关系**：F-04.1 字段映射与 S1/`reviewStatus` 拆分结论保持不变；F-04 主表仍为 **PARTIAL**（`restrictionType` 类别级 V1 等待决策），不因 F-04.2 单独改为 RESOLVED。
 
 **安全规则**：05 执行约束未因字段收口而删除；四种状态语义与 07 §2 决策表一致。
+
+### 15.5 F-04.3 定点修复（匹配可判定性 / 解除审计闭环）
+
+复核方法：人工重读 02 §2.3、§7.0.2、§7.4、§11；03 §4.2.1、§4.4—4.5；05 §5.3.2—5.3.3、§5.5—5.6；06 §8.4、§10.1.0、§10.1、§16.3；交叉核对 `not_matched`/`unresolved`、`allergy_change_logs`、别名 `reviewedBy`/`reviewedAt`/`version`。**未**执行代码或自动化测试。
+
+| 子项 | 优先级 | 结论 | 文档证据 |
+| --- | --- | --- | --- |
+| F-04.3-01 `not_matched` 安全数据完整性 | P1 | **PASS**（Spec 层） | 05 §5.3.2.1（`FoodSafetyProfile`/`FoodAllergen`/复合成分门禁）；02 §7.0.2 与 05 一致 |
+| F-04.3-02 匹配优先级与短路 | P1 | **PASS**（Spec 层） | 05 §5.3.2.3 场景 A/B/C 及最终 `not_matched` 条件 |
+| F-04.3-03 未知 `foodName` | P1 | **PASS**（Spec 层） | 05 §5.3.2.5；03 §4.4 名称与映射；§5.3.2.6 场景 11 确定性为 `unresolved` |
+| F-04.3-04 标准化碰撞 | P1 | **PASS**（Spec 层） | 05 §5.3.2.2 保留/去除字符及多实体碰撞 → `unresolved` |
+| F-04.3-05 别名审核元数据 | P2 | **PASS**（Spec 层） | 03 §4.2.1、§4.4 与 05 §5.3.2.4、§5.4 字段名一致；实体级审核 |
+| F-04.3-06 `AllergyChangeLog` 架构映射 | P1 | **PASS**（Spec 层） | 02 §7.0、§7.4、§11；06 §10.1.0、§10.1、§8.4、§16.3 |
+| F-04.3-07 解除审计闭环 | P1 | **PASS**（Spec 层） | 02 §7.4 `actorId`/`userConfirmationId`/…；05 §5.3.3 执行者与确认约束 |
+| F-04.3-08 解除后日程重验证 | P2 | **PASS**（Spec 层，未改文） | 02 §7.0.1、§7.4；05 §5.3.1、§5.3.3；04 §9.5；02 §7.4 `revalidationTriggered` 关联 |
+
+**F-04.3 总判定**：**PASS（Spec 层）** — 八项在 02/03/05/06 交叉对齐；**尚未**经实现层、集成测试或生产验证。F-04.2-01 过滤入口结论 **保持 PASS**，未降级。
+
+**与 F-04 主表关系**：F-04 仍为 **PARTIAL**（仅因 `restrictionType` 类别级 V1 待决策）；不因 F-04.3 单独改为 RESOLVED。

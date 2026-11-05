@@ -363,84 +363,213 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 | F | `active` + `pending_review` | `skipped` | 硬过滤 |
 | G | `active` + `rejected` | `none_known` | 硬过滤，除非已合法 `inactive` |
 
-### 5.3.2 S1 `foodName` 确定性文本匹配
+### 5.3.2 S1 过敏匹配（确定性）
 
-当禁忌项缺少可靠 `foodItemId` / `allergenId` 绑定，或需对候选内容名称与声明文本比对时，执行本节规则。**不得**使用模糊相似度、编辑距离或 NLP 语义等价自动认定两种食物相同。
+对**单条** `AllergyItem.status=active` 禁忌与**单个**候选（标准 `FoodItem`、食谱/复合食品及其展开成分、或待比对的名称键）执行本节。**不得**使用模糊相似度、编辑距离、拼音近似或 NLP 语义等价自动认定相同。
 
-**1. 原始声明**
-
-- `AllergyItem.foodName` 保存用户原始输入，**不得**被标准化结果覆盖。
-- 匹配计算使用派生键（见下文「标准化」），与持久化字段分离。
-
-**2. 标准化（确定性，按序应用）**
-
-对参与比对的字符串（用户 `foodName` 派生键、标准名、已审核别名）依次：
-
-1. 去除首尾空白（Unicode trim）。
-2. 将连续空白（含全角空格）折叠为单个半角空格。
-3. 全角 ASCII 字母数字及常见标点（如 `，`、`（`）映射为对应半角（若已是半角则不变）。
-4. 英文字母 `A—Z` 统一为小写（**仅** ASCII 字母；中文不变）。
-5. 去除首尾及词间**约定标点**：`，`、`,`、`、`、`、`·`、`-`（连字符）、`/`（**不**删除括号内语义字符，避免误合并不同食物）。
-
-**禁止**：拼音归一、简繁自动转换、Levenshtein/余弦相似度、未审核用户输入写入标准别名库。
-
-**3. 可信名称与别名来源**
-
-| 来源 | 条件 | 用途 |
-| --- | --- | --- |
-| `FoodItem.name` | `FoodItem.status` 为可进入生产推荐池的已发布状态（见 03 §4.5、02 §5.1.1） | 标准食材名 |
-| `FoodItem.aliases[]` | 所属 `FoodItem` 满足上表发布条件 | 已审核食材别名 |
-| `FoodAllergen.allergenName` / `aliases[]` | `FoodAllergen.status=active` 且字典项已完成内容审核发布（见 §5.4、`03` §4.4） | 过敏原标准名与别名 |
-
-未发布、草稿或未审核通过的别名**不得**用于自动 `not_matched` 放行。
-
-**4. 匹配流程（对单条 active 禁忌 vs 单个候选食材/名称）**
-
-1. 若禁忌已绑定 `foodItemId`：候选 `foodItemId` 相同 → `matched`；否则对候选展开成分后再比 ID。
-2. 若禁忌已绑定 `allergenId`：按 §5.3.1 第 2 条（已审核 `FoodAllergen` 映射）→ `matched` 或继续。
-3. 否则对禁忌 `foodName` 派生键与标准名/已审核别名派生键做**完全相等**比对 → 任一相等为 `matched`。
-4. 若候选为食谱且存在结构化 `RecipeIngredient`（03 §6.1）：对每个 `foodItemId` 重复步骤 1—2；对仅名称无 ID 的成分，按步骤 3 与禁忌文本比。
-5. 若候选为复合食品/食谱且**缺少**可展开的结构化成分：**不得**仅凭复合食品名称推断不含过敏原 → 对该禁忌判定为 `unresolved`（就本候选）。
-6. 若存在多个标准实体同名歧义（同一派生键命中多条未关联 ID 的标准记录）→ `unresolved`。
-7. 若完成 1—6 且未 `matched`、且所有必要数据完整可信 → `not_matched`；否则 → `unresolved`。
-
-**5. 逻辑结果与日程行为**
+**逻辑结果与日程行为**（三态定义）：
 
 | 结果 | 含义 | 自动推荐 / 日程生成 |
 | --- | --- | --- |
 | `matched` | 确定命中有效禁忌 | 硬过滤，禁止进入候选 |
-| `not_matched` | 依据完整可信数据确定未命中该条禁忌 | 可继续其他 L0 校验 |
-| `unresolved` | 信息不足、歧义或无法可靠判断 | **不得**当作 `not_matched` 放行；排除自动生成或待确认 |
+| `not_matched` | 在**本候选**上，全部必要匹配路径已完成，且候选及相关安全数据**完整并已审核发布**，确定未命中该条禁忌 | 可继续其他 L0 校验（**不**表示全局安全通过） |
+| `unresolved` | 信息不足、歧义、冲突或无法证明安全数据完整 | **不得**当作 `not_matched` 放行；排除自动生成或待确认 |
 
-**6. 别名治理与版本**
+**核心安全约束**：
 
-- 别名仅随 `FoodItem` / `FoodAllergen` 主数据审核发布；变更须可追溯 `reviewedBy`、`reviewedAt`、`version`（见 §5.4、03 §4.4）。
-- **不**新增独立别名集合；若未来需要独立别名审核流水，记为产品待决策项。
+1. 只有满足 §5.3.2.1 的数据完整性与审核条件，才允许对本候选返回 `not_matched`。
+2. 缺少必要安全数据、数据未审核、关联不完整、或存在名称/ID 冲突时，**不得**默认 `not_matched`。
+3. `unresolved` **不得**被视为安全通过。
 
-**7. 测试场景（规则层，供用例设计）**
+#### 5.3.2.1 安全数据完整性与 `not_matched` 门禁（F-04.3-01）
 
-1. 用户输入与标准 `FoodItem.name` 完全一致 → `matched`。
-2. 用户输入与已发布 `FoodItem.aliases` 某项一致 → `matched`。
-3. 用户输入与内容库中**未发布**或草稿别名一致 → 不得仅凭此 `not_matched`；通常 `unresolved` 直至映射或 ID 绑定。
-4. 全角/半角及空格差异 → 标准化后相等 → `matched`。
-5. 英文大小写差异 → `matched`。
-6. 相似但不同的名称（如不同食材）→ 无审核别名时不相等 → `not_matched` 或 `unresolved`（视候选数据完整性）。
-7. 复合食谱有结构化成分且含受限 `foodItemId` → `matched`。
-8. 复合食谱有结构化成分且不含受限项 → `not_matched`（对该禁忌）。
-9. 复合食谱缺少成分数据 → `unresolved`。
-10. 成分名称无法映射到标准库 → `unresolved`。
-11. 用户原始输入无法匹配任何已发布标准名/别名 → 对涉及该名称的候选倾向 `unresolved`；对已绑定 ID 的禁忌仍按 ID `matched`。
+「必要安全数据完整」指：针对**当前候选**及本禁忌**已启用的匹配路径**，下列条件均满足；任一不满足 → 对本候选**不得**返回 `not_matched`（返回 `unresolved` 或已在更早步骤返回 `matched`）。
+
+**A. 候选 `FoodItem`（含食谱成分展开后的食材）**
+
+| 检查项 | 完整条件 | 不完整时语义（不得当作「无过敏原」） |
+| --- | --- | --- |
+| 食材可参与生产过滤 | `FoodItem.status=published`（见 02 §5.1.1、03 §4.5） | 草稿/未发布/已撤回 → 数据不可用 |
+| 食材安全属性已建立 | 存在对应 `FoodSafetyProfile`（`foodItemId` 匹配） | **无记录** → 尚未建立安全属性，≠ 确认无过敏原 |
+| 食材过敏原关联已审核 | 该 `FoodSafetyProfile.reviewStatus` 为 `approved` 或 `published`（与 02 §8.1 内容审核语义一致） | `draft` / `pending_review` / `withdrawn` → 关联未审核或不可用 |
+| 关联结论可读取 | 审核通过后，`allergenIds` 表示**已审核**的关联过敏原 ID 列表；**空数组**表示「已完成审核且当前无已知关联过敏原」，**不等于**「未建立数据」 | 仅有 `FoodItem.allergenCodes` 而无已发布 `FoodSafetyProfile` → **不得**用于 `not_matched` 的过敏原路径 |
+
+**B. `FoodAllergen` 字典与映射（禁忌含 `allergenId` 或走过敏原关联匹配时）**
+
+| 情况 | 判定 |
+| --- | --- |
+| 字典项存在且 `FoodAllergen.status=active`，且实体级内容已发布（`reviewStatus` 为 `approved`/`published`，见 03 §4.4） | 可用于 `matched` / 在数据完整前提下参与 `not_matched` |
+| 无 `FoodAllergen` 记录或 `status=inactive` | 该 `allergenId` 路径 **unresolved** |
+| 字典存在但未完成内容审核发布 | **unresolved**；不得 `not_matched` |
+| 候选食材与过敏原的关联仅来自未审核 `FoodSafetyProfile` 或缺失 profile | **unresolved** |
+| 候选存在多个已审核过敏原关联且与禁忌 `allergenId` 比对的子路径未完成 | 继续执行 §5.3.2.3 顺序直至 `matched` 或门禁失败 |
+
+**禁止**：将「没有 `FoodAllergen` 记录」「没有 `FoodSafetyProfile` 记录」或「`allergenIds` 字段缺失」等同于「没有过敏原」。
+
+**C. 复合食品 / 食谱 / `RecipeIngredient`**
+
+| 检查项 | 完整条件 |
+| --- | --- |
+| 结构化成分 | 存在可读的 `RecipeIngredient`（或等价的已发布内容版本内嵌结构，见 03 §6.1） |
+| 食谱安全摘要 | 对应 `RecipeSafetyProfile.ingredientCompleteness=complete`，且 `reviewStatus` 为 `approved` 或 `published` |
+| 每个待判定成分 | 若成分为 `foodItemId`：按 **A** 判定；若仅名称无 ID：按 §5.3.2.3 场景 C 且**不得**对未映射名称 `not_matched` |
+
+任一成分安全数据不完整、或 `ingredientCompleteness` 为 `partial` / `incomplete` / 缺失 → 对该禁忌与本复合候选 **unresolved**。
+
+**D. `AllergyItem` 发布/审核与匹配**
+
+- `AllergyItem.status` 仅决定**是否参与 S1**；`reviewStatus` **不**跳过 active 禁忌的匹配。
+- 用户声明的 `foodName` 始终保留原值；**不**因 `reviewStatus=pending_review` 降低匹配强度。
+
+#### 5.3.2.2 名称标准化与碰撞（F-04.3-04）
+
+标准化**仅**用于派生比对键；**不得**覆盖 `AllergyItem.foodName` 或内容库原始名称。
+
+**允许的处理（按序、确定性）**：
+
+1. Unicode trim 首尾空白。
+2. 连续空白（含全角空格）折叠为单个半角空格。
+3. 全角 ASCII 字母数字及常见标点映射为半角。
+4. ASCII 字母 `A—Z` → 小写（中文不变）。
+5. 去除**词间与首尾**的约定分隔符：`，`、`,`、`、`、`、`·`、ASCII 空格、`/`、ASCII `-`（连字符）。
+
+**保留（具有语义，不得删除或替换）**：
+
+- 中文括号 `（）`、英文括号 `()` 及其**内部全文**（如「低筋（小麦）粉」与「低筋粉」不得因删括号合并）。
+- 数字、量词及单位字符（`g`、`ml`、`%` 等）。
+- 其他未列入「允许去除」的标点（如 `*`、`#`）→ 保留；若导致碰撞，按歧义处理。
+
+**碰撞处理**：
+
+| 场景 | 结果 |
+| --- | --- |
+| 不同原始名称标准化后得到同一 key | **不**合并为同一实体；检索时若命中多条 `FoodItem` / `FoodAllergen` → **unresolved** |
+| 同一 key 对应多个已发布标准实体 | **unresolved** |
+| 用户 `foodName` 派生键与标准 key 相等但存在多实体 | **unresolved** |
+| `FoodItem` 与 `FoodAllergen` 名称 key 冲突 | 分别维护命名空间；比对应在明确实体类型内进行；跨类型同名 **不得**自动 `matched` |
+
+**禁止**：拼音归一、简繁自动转换、Levenshtein/余弦相似度、删除括号内容、未经审核别名入库。
+
+#### 5.3.2.3 匹配执行顺序与短路（F-04.3-02）
+
+对单条禁忌 × 单候选，按下列**固定顺序**执行；**一旦**得到 `matched` **立即返回** `matched`。`not_matched` **仅**可在本节全部适用步骤执行完毕且 §5.3.2.1 门禁通过后返回。
+
+**步骤 0 — 候选身份**
+
+- 候选无法取得可靠 `foodItemId` 且无法进入食谱成分展开 → 文本路径前先看复合/食谱完整性；不完整 → **unresolved**。
+
+**场景 A：禁忌已绑定 `foodItemId`**
+
+| 步骤 | 条件 | 结果 | 是否继续 |
+| --- | --- | --- | --- |
+| A1 | 候选（或展开成分）`foodItemId` 相同 | **matched** | 否 |
+| A2 | 候选为食谱：展开 `RecipeIngredient` 后对任一成分 A1 | **matched** | 否 |
+| A3 | 候选 ID 不同且可证明为不同标准实体，且 **A** 完整 | 继续 B/C（**不**因 ID 不同直接 `not_matched`） | 是 |
+| A4 | 候选 ID 不同但 **A** 不完整 | **unresolved** | 否 |
+| A5 | 禁忌有 `foodItemId` 但候选仅名称、无法关联到该 ID | **unresolved**（不得用名称否定 ID 禁忌） | 否 |
+
+**场景 B：禁忌已绑定 `allergenId`（在 A 未 `matched` 后执行）**
+
+| 步骤 | 条件 | 结果 | 是否继续 |
+| --- | --- | --- | --- |
+| B1 | 候选（或成分）经**已审核** `FoodSafetyProfile` 的 `allergenIds` 含该 `allergenId` | **matched** | 否 |
+| B2 | `FoodAllergen` 未发布/未审核/缺失 | **unresolved** | 否 |
+| B3 | 关联数据未审核（**A** 失败） | **unresolved** | 否 |
+| B4 | 多个过敏原关联且尚未完成对本 `allergenId` 的判定 | 继续直至 B1/B2/B3 或进入 C | 是 |
+| B5 | **B** 完整且已确认候选（及所需展开）不含该 `allergenId` | 继续 C（**不得**仅此步 `not_matched` 若仍有 C 待执行） | 是 |
+
+**场景 C：禁忌存在 `foodName` 和/或仅余文本路径（A/B 未 `matched`）**
+
+| 步骤 | 条件 | 结果 | 是否继续 |
+| --- | --- | --- | --- |
+| C1 | 派生键与**唯一**已发布 `FoodItem.name` 或实体级已审核 `aliases[]` 相等 | **matched** | 否 |
+| C2 | 派生键与**唯一**已发布 `FoodAllergen` 标准名/已审核别名相等且与禁忌声明语义一致（食物级禁忌） | **matched** | 否 |
+| C3 | 命中 0 个标准名/别名 | 见 §5.3.2.5 | — |
+| C4 | 命中 \>1 个标准实体 | **unresolved** | 否 |
+| C5 | 复合候选缺成分或 `RecipeSafetyProfile` 不完整 | **unresolved** | 否 |
+
+**最终 `not_matched`（仅当同时满足）**：
+
+1. 上述适用步骤均未 `matched`；
+2. §5.3.2.1 对本候选及已走路径**全部通过**；
+3. 不存在 C4/C5 及 A4/A5/B2/B3 类 **unresolved** 条件；
+4. 对仅 `foodName` 禁忌且 C3 适用：已确认用户声明文本**无法**映射到任何标准实体，且候选 side 数据完整（见 §5.3.2.5）。
+
+**明确规则**：
+
+- ID 不匹配 **允许** 继续过敏原与文本路径；**不允许** 在 **A** 不完整时以文本 `not_matched` 放行。
+- `allergenId` 未命中 **允许** 继续 **C**；**不允许** 在 **B** 不完整时用文本 `not_matched`。
+- 数据不完整时 **禁止** 通过任一分支得到 `not_matched`。
+
+#### 5.3.2.4 可信名称与别名来源（F-04.3-05）
+
+| 来源 | 条件 | 用途 |
+| --- | --- | --- |
+| `FoodItem.name` | `FoodItem.status=published` | 标准食材名 |
+| `FoodItem.aliases[]` | 所属实体 `status=published` 且实体级 `reviewStatus` 为 `approved`/`published`；别名随实体**整包**审核（03 §4.2.1） | 已审核食材别名 |
+| `FoodAllergen.allergenName` / `aliases[]` | `FoodAllergen.status=active` 且实体级内容已发布（03 §4.4） | 过敏原标准名与别名 |
+
+未发布、草稿、审核中或已撤回版本的别名 **不得** 参与自动 `not_matched` 或 `matched`（除 C3 中「零命中 → unresolved」）。
+
+实体级 `reviewedBy`、`reviewedAt`、`version` 字段归属与生命周期见 **03 §4.2.1、§4.4**；05 仅约束其参与匹配的准入。
+
+#### 5.3.2.5 未知 `foodName` 与无法映射输入（F-04.3-03）
+
+1. 无法匹配任何已发布标准名或实体级已审核别名 → **不得** 判定为安全；对本候选返回 **unresolved**（非「倾向」）。
+2. 无法确认用户输入对应**哪一个**标准 `FoodItem` / 声明对象 → **unresolved**。
+3. **禁止** 模糊匹配、拼音、编辑距离、未经审核别名 → `not_matched`。
+4. 用户输入可对应多个标准实体 → **unresolved**；产品应引导用户选择标准食材或补充信息（绑定 `foodItemId`）。
+5. 复合食品名称无法完整解析成分 → **unresolved**。
+6. 禁忌已绑定可靠 `foodItemId` / `allergenId` 时，**仍优先** A/B 路径；未知 `foodName` 不削弱 ID 级 `matched`。
+7. 仅当禁忌**仅有** `foodName`、且 C3「零命中」、且候选侧 §5.3.2.1 完整时，方可对**该文本声明**在完整候选上得出 `not_matched`（表示「该候选与声明文本无等价已审核映射」）；仍 **unresolved** 若用户声明本身尚未与标准库建立唯一映射且产品要求人工确认。
+
+#### 5.3.2.6 测试场景（规则层，确定性）
+
+| # | 场景 | 预期 |
+| --- | --- | --- |
+| 1 | 用户 `foodName` 与已发布 `FoodItem.name` 派生键相等且唯一 | `matched` |
+| 2 | 与已发布实体级已审核 `FoodItem.aliases` 某项相等且唯一 | `matched` |
+| 3 | 与草稿/未发布别名相等 | `unresolved` |
+| 4 | 全角/半角、空格、约定标点差异 | 标准化后相等 → `matched`（唯一实体） |
+| 5 | 英文大小写差异 | `matched`（唯一实体） |
+| 6 | 相似但不同名称，无审核别名，候选 **A** 完整 | `not_matched` |
+| 6b | 同上但缺 `FoodSafetyProfile` 或未审核 | `unresolved` |
+| 7 | 复合食谱成分含禁忌 `foodItemId` | `matched` |
+| 8 | 复合食谱 `ingredientCompleteness=complete` 且各成分 **A** 完整且无命中 | `not_matched` |
+| 9 | 复合食谱缺成分或 `ingredientCompleteness`≠`complete` | `unresolved` |
+| 10 | 成分仅名称且无法映射标准库 | `unresolved` |
+| 11 | 用户 `foodName` 零命中已发布名/别名 | `unresolved`（对依赖该文本的候选） |
+| 12 | 禁忌 `foodItemId` 与候选 ID 相同 | `matched`（不依赖 `foodName`） |
+| 13 | 禁忌 `allergenId` 命中已审核 `FoodSafetyProfile.allergenIds` | `matched` |
+| 14 | 禁忌 `allergenId` 但无已审核 profile | `unresolved` |
+| 15 | 标准化 key 碰撞多实体 | `unresolved` |
+| 16 | 全部路径完成、门禁通过、无命中 | `not_matched` |
 
 ### 5.3.3 专业审核拒绝与解除限制
 
-**权限边界（F-04.2）**：
+**权限边界（F-04.2 / F-04.3-07）**：
 
 1. `reviewStatus=rejected` **仅**表示专业复核结论，**不得**自动修改 `AllergyItem.status`。
 2. 专业人员、后台审核任务或自动化 **不得**仅凭将 `reviewStatus` 设为 `rejected` 把 `status` 改为 `inactive`。
 3. 在 `status=active` 期间（含 `reviewStatus=rejected`），S1 **继续**硬过滤。
 4. **仅**用户在产品内完成明确解除确认（及 SAF-10 规定的安全流程）后，方可将 `status` 更新为 `inactive`。
-5. 解除须写入 `AllergyChangeLog`（02 §7.4）：操作主体、时间、原因/确认依据、变更前后状态。
-6. 解除后须重新校验未来未执行 `ScheduleTask`；已执行历史不得追溯修改。
+5. 解除 **必须** 写入完整 `AllergyChangeLog`（02 §7.4）；**缺少必填审计字段视为解除未成功**，不得将 `AllergyItem.status` 持久化为 `inactive`。
+6. 解除后须重新校验未来未执行 `ScheduleTask`（§5.3.1、04 §9.5）；已执行历史不得追溯修改；审计须能关联本次解除触发的重校验（`revalidationTriggered` / `revalidationReference`）。
+
+**执行者与用户确认（不得用 `source` 替代）**：
+
+| 角色 | 要求 |
+| --- | --- |
+| `actorId` | **实际执行**写库/解除动作的主体（用户 ID、管理员 ID 或服务账号）；必填 |
+| `initiatedBy` | 发起请求主体；与 `actorId` 不同时必填（如用户发起、管理员代提交） |
+| `userConfirmationId` | 用户明确确认凭证 ID（服务端生成的确认流水/会话 ID）；用户本人操作与管理员代操作 **均** 必填 |
+| `userConfirmationAt` | 用户确认完成时间；必填 |
+| `confirmationScope` | 确认对象摘要（如 `AllergyItem._id`、解除前后 `status`）；须与 `changedItems` 一致 |
+
+- `source=user_action`：用户本人执行；仍须 `userConfirmationId`（产品确认步）。
+- `source=admin_on_behalf_with_user_confirm`：管理员代执行；**必须**有可追溯的 `userConfirmationId`，**不得**仅管理员填写 `reason` 视为用户确认。
+- `source=professional_review` / 审核拒绝：**不得**用于 `changeType=allergy_item_deactivated`。
+- 操作失败或被拒绝：若写审计，须 `outcome=failed` / `rejected` 且 **不得** 将 `AllergyItem.status` 改为 `inactive`。
 
 专业审核拒绝后，产品可向用户展示复核结论并引导确认是否解除声明；在用户确认前，生效限制仍以 `status=active` 为准。
 
@@ -457,6 +586,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 | sourceReferences | 来源依据          |
 | relatedFoodItems | 关联食材          |
 | status           | active / inactive |
+| reviewStatus     | 内容审核状态（03 §4.4） |
 | reviewedBy       | 审核人            |
 | reviewedAt       | 审核时间          |
 | version          | 字典版本          |
@@ -496,7 +626,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 | ---------------------- | -------------- |
 | recipeId               | 食谱 ID        |
 | contentVersionId       | 内容版本       |
-| ingredientCompleteness | 食材信息完整性 |
+| ingredientCompleteness | 食材信息完整性：`complete` / `partial` / `incomplete`（S1 仅 `complete` 且已审核发布时允许复合候选 `not_matched`，见 §5.3.2.1） |
 | allergenSummary        | 过敏原汇总     |
 | preparationSafety      | 制作安全要求   |
 | textureProfile         | 质地适用信息   |

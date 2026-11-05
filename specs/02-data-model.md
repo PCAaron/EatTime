@@ -136,6 +136,10 @@ erDiagram
 | UserSafetyProfile | 是        | 每档案用户安全档案（过敏状态权威存储；`AllergyProfile` 仅为 §7.1 逻辑别名，非独立持久化实体） |
 | AllergyItem      | 是           | 已知过敏食物清单（05 逻辑名 `AllergyRestriction`）   |
 | FoodObservation  | 是           | 新食物观察记录     |
+| FoodAllergen     | 是           | 过敏原字典（`food_allergens`） |
+| FoodSafetyProfile | 是        | 食材侧已审核安全属性（可后台维护） |
+| RecipeSafetyProfile | 是      | 食谱侧已审核安全属性 |
+| AllergyChangeLog | 是           | 过敏状态与禁忌变更审计（追加写入） |
 | SafetyRule       | 是           | 安全规则           |
 | RuleVersion      | 是           | 规则版本           |
 | ContentVersion   | 是           | 内容版本           |
@@ -436,6 +440,8 @@ Recipe 食谱
 | `sourceReferences` | array    | 否   | 来源依据               |
 | `createdAt`        | datetime | 是   | 创建时间               |
 | `updatedAt`        | datetime | 是   | 更新时间               |
+
+内容审核与别名发布元数据（`reviewStatus`、`reviewedBy`、`reviewedAt`、`version`）以 `specs/03-content-spec.md` §4.2—4.2.1 为准；S1 匹配准入见 05 §5.3.2.4。
 
 `FoodItem.status` 与 `Recipe.status` 使用同一套内容生命周期枚举（§5.1.1）。
 
@@ -830,6 +836,13 @@ Recipe 食谱
 
 `FoodSafetyProfile`、`RecipeSafetyProfile`：内容侧安全属性，结构与 05 §5.5—5.6 一致；可与 `ContentVersion` 快照冗余，但生产过滤以已审核发布记录为准。
 
+**S1 匹配用安全数据（F-04.3-01，与 05 §5.3.2.1 一致）**：
+
+1. 候选 `FoodItem` 须 `status=published`，且存在 `FoodSafetyProfile`（`foodItemId`）且 `reviewStatus` 为 `approved`/`published`，方可在过敏原关联路径上视为数据完整。
+2. `FoodSafetyProfile.allergenIds` 为空数组且已满足上条 → 表示**已审核确认**当前无已知关联过敏原；**无** `FoodSafetyProfile` 记录 ≠ 无过敏原。
+3. 食谱/复合候选须 `RecipeSafetyProfile.ingredientCompleteness=complete` 且已审核发布，方可对展开成分做 `not_matched` 结论。
+4. `FoodItem.allergenCodes` 为内容标签，**不能**单独替代 `FoodSafetyProfile` 用于 S1 `not_matched` 门禁。
+
 ### 7.0.3 DeclaredRestriction 孕期/档案级声明限制（SAF-08 已采纳）
 
 用途：存储用户从**经专业审核后发布**的限制字典中选择的声明项；不是医学诊断结果，也不替代 `SafetyRule` 硬过滤。
@@ -1018,7 +1031,7 @@ Recipe 食谱
 
 ### 7.4 过敏信息变更历史
 
-建议增加 `AllergyChangeLog`，用于记录过敏状态及禁忌清单变化。
+`AllergyChangeLog` 用于记录过敏状态及禁忌清单变化；集合 `allergy_change_logs`（见 §11、06 §10.1.0）。**追加写入**；用户客户端 **不得** 直接创建、修改或删除。
 
 字段：
 
@@ -1026,17 +1039,32 @@ Recipe 食谱
 | ---------------- | -------- | ---- | ----------- |
 | `_id`            | string   | 是   | 记录 ID     |
 | `profileId`      | string   | 是   | 业务档案 ID |
+| `allergyItemId`  | string   | 条件 | 禁忌项 ID；`changeType` 涉及单条 `AllergyItem` 时必填（如 `allergy_item_deactivated`） |
 | `previousStatus` | string   | 否   | 修改前状态（档案级 `allergyStatus` 或禁忌项 `AllergyItem.status`） |
 | `nextStatus`     | string   | 是   | 修改后状态  |
 | `changeType`     | string   | 是   | 变更类型（如 `allergy_status_change`、`allergy_item_deactivated`、`allergy_item_created`） |
 | `changedItems`   | array    | 否   | 涉及的 `AllergyItem._id` 及变更摘要（含变更前后 `status` / `reviewStatus` 快照） |
-| `source`         | string   | 是   | 变更来源（含操作主体：如 `user_action` / `admin_on_behalf_with_user_confirm`；**不得**单独使用 `professional_review_reject` 作为将 `status` 置 `inactive` 的来源） |
-| `reason`         | string   | 否   | 用户确认依据或产品定义的解除原因摘要 |
-| `createdAt`      | datetime | 是   | 变更时间    |
+| `source`         | string   | 是   | 操作来源：`user_action` / `admin_on_behalf_with_user_confirm` / `system_automation` / `content_mutation` 等；**不得**单独使用 `professional_review_reject` 作为将 `status` 置 `inactive` 的来源 |
+| `actorId`        | string   | 是   | **实际执行**变更的主体（用户、管理员或服务账号 ID） |
+| `initiatedBy`    | string   | 条件 | 发起者 ID；与 `actorId` 不同时必填 |
+| `userConfirmationId` | string | 条件 | 用户明确确认凭证 ID（服务端确认流水）；`allergy_item_deactivated` **必填**；**不得**存储敏感原文 |
+| `userConfirmationAt` | datetime | 条件 | 用户确认时间；与 `userConfirmationId` 同时必填 |
+| `confirmationScope` | object | 条件 | 确认对象（如 `allergyItemId`、确认文案摘要 ID）；须可关联至本次解除 |
+| `reason`         | string   | 否   | 非敏感摘要；**不能**替代 `userConfirmationId` |
+| `outcome`        | string   | 是   | `success` / `failed` / `rejected` |
+| `revalidationTriggered` | boolean | 否 | 是否已触发未来未执行 `ScheduleTask` 重校验 |
+| `revalidationReference` | string | 否 | 重校验任务/批次引用 ID，便于与 04 §9.5 追溯 |
+| `createdAt`      | datetime | 是   | 记录写入时间    |
 
-**解除限制审计（F-04.2）**：将 `AllergyItem.status` 从 `active` 变为 `inactive` 时**必须**写入一条 `AllergyChangeLog`，且 `changeType=allergy_item_deactivated`，`source` 须能区分用户本人确认与代操作；**不得**因 `reviewStatus` 变为 `rejected` 而省略用户确认步骤或省略本条日志。
+**解除限制审计（F-04.2 / F-04.3-07）**：
 
-变更后必须触发未来未执行日程的安全校验；不得追溯修改已执行 `ScheduleTask` 的历史内容。
+1. 将 `AllergyItem.status` 从 `active` 变为 `inactive` 时 **必须** 写入一条 `outcome=success` 的 `AllergyChangeLog`，且 `changeType=allergy_item_deactivated`，`allergyItemId` 与 `changedItems` 一致。
+2. `actorId`、`userConfirmationId`、`userConfirmationAt` 必填；管理员代操作须 `source=admin_on_behalf_with_user_confirm` 且确认凭证可关联至该 `AllergyItem` 与本次解除。
+3. **不得**因 `reviewStatus` 变为 `rejected` 而省略用户确认或省略本条日志。
+4. 审计缺失或无法关联具体 `AllergyItem` → **不得**视为解除成功。
+5. 解除成功后须 `revalidationTriggered=true`（或写入 `revalidationReference`）；仅影响**未来未执行**任务（§7.0.1、05 §5.3.1）；**不得**追溯修改已执行 `ScheduleTask`。
+
+**历史数据兼容**：F-04.3 之前已存在的日志可缺少 `actorId` / `userConfirmationId`；新解除操作从实施日起须满足上表必填条件。
 
 ---
 
@@ -1316,6 +1344,8 @@ Recipe 食谱
 | allergy_items      | 查询有效禁忌（S1）   | `profileId + status`（过滤条件 `status=active`） |
 | user_safety_profiles | 查询档案安全头     | `profileId`                     |
 | food_observations  | 查询观察记录         | `profileId + attemptedAt`       |
+| allergy_change_logs | 查询档案变更审计   | `profileId + createdAt`         |
+| allergy_change_logs | 按禁忌项追溯         | `allergyItemId + createdAt`     |
 | safety_rules       | 查询有效安全规则     | `reviewStatus + effectiveAt`    |
 | content_versions   | 查询内容版本         | `contentId + version`           |
 | business_events    | 按档案及时间统计     | `profileId + occurredAt`        |

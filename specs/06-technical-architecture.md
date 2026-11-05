@@ -668,9 +668,16 @@ SafetyCheckResult
 
 ### 8.4 安全档案更新
 
+**过敏禁忌解除与审计（F-04.3-06 / F-04.3-07）**：
+
+- `AllergyChangeLog` 写入集合 `allergy_change_logs`（02 §7.4）；分类：**用户安全数据审计**，与通用 `audit_logs` 并存、不重复建第二套禁忌审计集合。
+- 仅 **`safety` / `profile` 云函数**（或等价应用服务）在业务校验通过后 **追加** 写入；小程序客户端 **只读** 或经云函数间接查询，**不得**直写。
+- `allergy_item_deactivated` 须校验 `actorId`、`userConfirmationId`、`outcome=success` 后方能更新 `allergy_items.status`；失败须 `outcome=failed`/`rejected` 且不改 `status`。
+- 成功解除后触发 §8.4 重新校验流程，并在日志中记录 `revalidationTriggered` / `revalidationReference`。
+
 安全信息发生变化时：
 
-1. 保存新版本。
+1. 保存新版本（含 `AllergyChangeLog` 追加，适用时）。
 2. 创建重新校验任务。
 3. 查询未来未执行日程。
 4. 对相关食谱重新执行安全校验。
@@ -803,6 +810,7 @@ cloud database
 | `allergy_items` | `AllergyItem` | 用户已知过敏禁忌（05 逻辑名 AllergyRestriction） |
 | `allergy_profiles` | — | **已废弃**；历史数据应迁移至 `user_safety_profiles` |
 | `food_observations` | `FoodObservation` | 新食物观察 |
+| `allergy_change_logs` | `AllergyChangeLog` | 过敏状态与禁忌变更审计（仅服务端追加） |
 | `food_allergens` | `FoodAllergen` | 过敏原字典 |
 | `food_safety_profiles` | `FoodSafetyProfile` | 食材侧安全属性 |
 | `recipe_safety_profiles` | `RecipeSafetyProfile` | 食谱侧安全属性 |
@@ -843,6 +851,7 @@ cloud database
 | ------------------------ | ------------ |
 | `user_safety_profiles`   | 用户安全档案（`UserSafetyProfile`） |
 | `allergy_items`          | 用户已知过敏禁忌（`AllergyItem`）   |
+| `allergy_change_logs`    | 过敏变更审计（`AllergyChangeLog`，追加写入） |
 | `food_safety_profiles`   | 食材安全属性 |
 | `recipe_safety_profiles` | 食谱安全属性 |
 | `safety_rules`           | 安全规则     |
@@ -863,6 +872,7 @@ cloud database
 | 集合                  | 用途               |
 | --------------------- | ------------------ |
 | `audit_logs`          | 管理操作及安全审计 |
+| `allergy_change_logs` | 用户过敏状态与禁忌变更审计（与 02 §7.4 一致；**非**通用 `audit_logs` 替代品） |
 | `analytics_events`    | 用户行为事件       |
 | `idempotency_records` | 幂等请求记录       |
 | `background_jobs`     | 后台任务记录       |
@@ -1240,6 +1250,7 @@ BackgroundJob
 
 - 过敏禁忌。
 - 安全档案。
+- 过敏变更审计（`allergy_change_logs`）。
 - 日程任务。
 - 内容发布状态。
 - 安全规则。

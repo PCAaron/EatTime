@@ -273,7 +273,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 | 投影名 | 来源实体 | 说明 |
 | --- | --- | --- |
-| `knownAllergies` | `AllergyItem`（`profileId` + 有效 `status`） | 列表/详情展示用；过滤与写入以 `allergy_items` 为准 |
+| `knownAllergies` | `AllergyItem`（`profileId` + `status=active`） | 列表/详情展示用；S1 硬过滤与写入以 `allergy_items` 为准；`reviewStatus` 不改变是否过滤 |
 | `observations` | `FoodObservation`（`profileId`） | 列表/详情展示用；写入以 `food_observations` 为准 |
 
 过敏状态沿用：
@@ -292,24 +292,58 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 | 字段              | 说明                               |
 | ----------------- | ---------------------------------- |
 | restrictionId     | 禁忌记录 ID（→ `AllergyItem._id`） |
-| profileId         | 对应业务档案                       |
-| foodItemId        | 对应食材                           |
+| profileId         | 对应业务档案（→ `AllergyItem.profileId`） |
+| foodItemId        | 对应食材（→ `AllergyItem.foodItemId`，条件必填） |
+| foodName          | 食物名称（→ `AllergyItem.foodName`；无 `foodItemId` 时必填，见 §5.3.1） |
 | allergenId        | 对应过敏原（→ `AllergyItem.allergenId`，可选） |
-| restrictionType   | 食物、食材类别或其他限制（V1 食物级以 `foodItemId`/`foodName` 为主；类别级扩展见 02 映射表） |
-| declarationSource | 用户声明、医疗人员确认或其他来源（→ `AllergyItem.source`） |
+| restrictionType   | 食物、食材类别或其他限制（→ **V1 无独立持久化字段**；食物级以 `foodItemId`/`allergenId`/`foodName` 表达；类别级 `DECISION_REQUIRED`，见 02 §7.2） |
+| declarationType   | 声明/确认性质（→ `AllergyItem.declarationType`：`user_reported` / `professionally_confirmed`） |
+| declarationSource | 信息来源（→ `AllergyItem.source`；**不得**与 `declarationType` 合并） |
 | evidenceReference | 可选的依据引用（→ `AllergyItem.evidenceReference`） |
-| status            | `active` / `inactive` / `pending_review`（→ `AllergyItem.status`） |
+| status            | 限制是否生效（→ `AllergyItem.status`：`active` / `inactive`） |
+| reviewStatus      | 专业复核进度（→ `AllergyItem.reviewStatus`；**不**决定 S1 是否硬过滤） |
 | declaredAt        | 声明时间（→ `AllergyItem.createdAt`） |
-| updatedAt         | 更新时间                           |
-| notes             | 用户补充信息                       |
+| updatedAt         | 更新时间（→ `AllergyItem.updatedAt`） |
+| notes             | 用户补充信息（→ `AllergyItem.notes`） |
+
+**逐字段处理结论**（与 02 §7.2 映射表一致）：除 `restrictionType` 类别级能力为 `DECISION_REQUIRED` 外，上表字段均为 `MAPPED` 或 `RETAINED`（`profileId`、`foodItemId`、`allergenId` 为规范持久化字段 `RETAINED`）。
 
 要求：
 
 1. 用户声明必须保留原始含义。
-2. 不允许自动把用户声明升级为医学确诊。
+2. 不允许自动把用户声明升级为医学确诊（`declarationType` 不得自动变为 `professionally_confirmed`）。
 3. 不允许 AI 自动解除禁忌。
-4. 解除禁忌必须经过明确用户操作，并按产品定义的专业安全流程处理。
-5. 已失效记录仍应保留历史审计信息。
+4. 解除禁忌必须经过明确用户操作（`status=inactive`），并按产品定义的专业安全流程处理。
+5. 已失效记录（`status=inactive`）仍应保留历史审计信息。
+6. 用户新增已知过敏项时默认 `status=active`；不得因等待专业复核而暂时放开硬过滤。
+
+### 5.3.1 S1 用户过敏禁忌硬过滤
+
+与 §3.2 S1 及 02 §7.2 一致；日程引擎与安全规则中心**必须**共用下列规则，不得在 UI 或云函数中另写一套。
+
+**有效禁忌集合**：
+
+- 查询条件：`AllergyItem.profileId` = 当前档案且 `AllergyItem.status` = `active`。
+- **不**使用 `reviewStatus`、`declarationType` 或 `source` 作为是否进入 S1 的判断条件。
+
+**候选食谱/食材命中**（满足任一即 `block`）：
+
+1. 食谱（含配料展开）关联的 `foodItemId` 与禁忌项 `foodItemId` 相同。
+2. 食谱关联食材经已审核 `FoodAllergen` 映射，与禁忌项 `allergenId` 相同。
+3. 禁忌项仅有 `foodName`（或映射待复核）：按产品定义的保守文本/别名匹配规则命中该食物或其已审核别名；**不得**因 `reviewStatus=pending_review` 跳过。
+4. V1 **不支持**类别级 `restrictionType` 的自动硬过滤；若未来扩展须单独产品决议并更新 02/05。
+
+**明确问答**：
+
+| 问题 | 结论 |
+| --- | --- |
+| 用户声明已知过敏后是否立即硬过滤？ | **是**（创建时 `status=active`） |
+| `reviewStatus=pending_review` 时是否仍硬过滤？ | **是**（当 `status=active`） |
+| `user_reported` 与 `professionally_confirmed` 是否影响生效？ | **否**（仅标注与流程） |
+| 如何解除限制？ | 用户明确操作置 `status=inactive`（及 SAF-10 等专业流程）；禁止 AI 自动解除 |
+| 限制变更后是否重新校验未执行日程？ | **是**（§14、02 §7.0.1） |
+
+**变更触发**：`AllergyItem` 的 `status`、`foodItemId`、`allergenId`、`foodName` 或关联 `UserSafetyProfile.allergyStatus` 变更后，须重新校验未来未执行 `ScheduleTask`。
 
 ### 5.4 FoodAllergen
 
@@ -498,8 +532,8 @@ confirmed_allergy
 3. 保存用户声明。
 4. 映射到标准食材或过敏原字典。
 5. 对无法映射的食物保留原始文本。
-6. 无法准确映射时进入待审核状态。
-7. 启用相关食谱过滤。
+6. 无法准确映射时：`status` 仍为 `active` 并启用过滤；`reviewStatus=pending_review` 供专业人员后续复核映射。
+7. 启用相关食谱过滤（S1，见 §5.3.1）。
 8. 重新检查未来未执行任务。
 
 不能因为某个用户声明的食物尚未匹配到字典，就忽略该声明。

@@ -869,17 +869,21 @@ Recipe 食谱
 
 | 05 逻辑字段 | 02 规范字段 | 处理方式 | 说明 |
 | --- | --- | --- | --- |
-| `restrictionId` | `_id` | 映射 | 禁忌记录主键 |
-| `profileId` | `profileId` | 保留 | 业务档案 |
-| `foodItemId` | `foodItemId` | 保留 | 标准食材（条件必填） |
-| `allergenId` | `allergenId` | 保留（可选） | 关联 `FoodAllergen`；无食材 ID 时可单独引用过敏原 |
-| `restrictionType` | — | 业务语义 | V1 以具体 `foodItemId` / `foodName` 表达食物级禁忌；类别级限制若需独立建模待产品决策 |
-| `declarationSource` | `source` | 映射 | 声明来源 |
-| `evidenceReference` | `evidenceReference` | 保留（可选） | 依据引用，非医学诊断结论 |
-| `status` | `status` | 映射 | 含 `pending_review` 时见下方枚举 |
-| `declaredAt` | `createdAt` | 映射 | 首次声明时间以创建时间为准；更新见 `updatedAt` |
-| `updatedAt` | `updatedAt` | 保留 | |
-| `notes` | `notes` | 保留 | 用户补充说明 |
+| `restrictionId` | `_id` | `MAPPED` | 禁忌记录主键 |
+| `profileId` | `profileId` | `RETAINED` | 业务档案 |
+| `foodItemId` | `foodItemId` | `RETAINED` | 标准食材（条件必填） |
+| `allergenId` | `allergenId` | `RETAINED` | 关联 `FoodAllergen`（可选） |
+| `restrictionType` | — | `DECISION_REQUIRED` | V1 **仅**支持食物级禁忌（`foodItemId` / `allergenId` / `foodName`）；食材类别级限制不得视为一期已支持能力 |
+| `declarationSource` | `source` | `MAPPED` | 信息**来源**（谁提供/从哪录入）；与 `declarationType` 不可互替 |
+| `declarationType` | `declarationType` | `MAPPED` | 声明/确认**性质**（用户声明 vs 专业确认）；不决定限制是否生效 |
+| `foodName` | `foodName` | `MAPPED` | 用户可见食物名；无 `foodItemId` 时用于展示与 S1 文本级匹配（见 05 §5.3.1） |
+| `evidenceReference` | `evidenceReference` | `MAPPED`（可选） | 依据引用，非医学诊断结论 |
+| `status` | `status` | `MAPPED` | **限制是否生效**（硬过滤开关）；仅 `active` / `inactive` |
+| `reviewStatus` | `reviewStatus` | `MAPPED` | **专业复核进度**；与限制是否生效分离；见下方枚举 |
+| `declaredAt` | `createdAt` | `MAPPED` | 首次声明时间以创建时间为准；更新见 `updatedAt` |
+| `updatedAt` | `updatedAt` | `MAPPED` | |
+| `notes` | `notes` | `MAPPED` | 用户补充说明 |
+| `userSafetyProfileId` | `userSafetyProfileId` | `MAPPED` | 关联 `UserSafetyProfile._id`（05 逻辑层未单列时由实现读取） |
 
 建议字段：
 
@@ -891,33 +895,67 @@ Recipe 食谱
 | `foodItemId`       | string   | 条件必填 | 标准食材 ID     |
 | `foodName`         | string   | 条件必填 | 食物名称        |
 | `allergenId`       | string   | 否       | 标准过敏原 ID（`FoodAllergen`） |
-| `declarationType`  | string   | 是       | 信息类型        |
-| `source`           | string   | 否       | 信息来源（对应 05 `declarationSource`） |
+| `declarationType`  | string   | 是       | 声明/确认性质（见下文）；默认 `user_reported` |
+| `source`           | string   | 否       | 信息来源（对应 05 `declarationSource`）；建议：`user_declaration` / `professional_record` / `other` |
 | `evidenceReference` | string  | 否       | 可选依据引用    |
-| `status`           | string   | 是       | 当前记录状态    |
+| `status`           | string   | 是       | 限制是否生效；默认 `active` |
+| `reviewStatus`     | string   | 是       | 专业复核状态；默认 `not_required` |
 | `notes`            | string   | 否       | 补充说明        |
 | `createdAt`        | datetime | 是       | 创建时间        |
 | `updatedAt`        | datetime | 是       | 更新时间        |
 
 > 历史字段名 `allergyProfileId` 已废弃，统一为 `userSafetyProfileId`。
 
-`declarationType`：
+`declarationType`（声明/确认性质，**不**参与「是否硬过滤」判断）：
 
-- `user_reported`
-- `professionally_confirmed`
+- `user_reported`：用户主动声明的已知过敏/需回避食物。
+- `professionally_confirmed`：专业人员依据记录确认；**不得**由系统将 `user_reported` 自动升级为此值。
+
+`source` / `declarationSource`（信息来源，**不**等同于 `declarationType`）：
+
+- 表示记录从何处进入系统（如用户入口、专业人员代录、其他可信渠道）。
+- 同一 `user_reported` 可来自 `user_declaration`；专业确认记录通常 `source=professional_record` 且 `declarationType=professionally_confirmed`，但二者字段语义仍须分别维护。
+
+`status`（限制是否生效 — **S1 硬过滤唯一开关**）：
+
+- `active`：用户当前有效的已知禁忌，**立即**参与 S1 硬过滤。
+- `inactive`：用户已明确解除或停用的禁忌，**不**参与硬过滤；须保留审计，并触发未执行日程重新校验（见 05 §5.3.1、§14）。
+
+`reviewStatus`（专业复核进度 — **不得**替代 `status` 决定是否硬过滤）：
+
+- `not_required`：映射完整、无需排队专业复核（实现默认，当已绑定可靠 `foodItemId` 或 `allergenId` 时可选用）。
+- `pending_review`：待专业人员复核映射或记录准确性（如仅有 `foodName`、字典未命中）；**仍须**在 `status=active` 时执行 S1 硬过滤。
+- `reviewed`：已完成专业复核；**不改变** `status=active` 时的硬过滤行为。
+- `rejected`：专业复核不认可该限制；须走明确产品流程将 `status` 置为 `inactive`（或用户确认解除），**禁止**仅改 `reviewStatus` 而静默放开日程。
+
+**创建默认值（用户新增已知过敏项）**：
+
+1. `status=active`（用户声明即生效，满足 PRD/05 S1）。
+2. `declarationType=user_reported`（除非录入通道已标识专业确认）。
+3. `reviewStatus=pending_review` 当无法绑定 `foodItemId`/`allergenId` 且依赖 `foodName` 或映射不确定；否则 `not_required`。
+
+**日程引擎 / 安全规则中心读取（S1）**：
+
+- 查询有效禁忌：`profileId` 匹配且 `status=active`（索引见 §12）。
+- 命中逻辑以 05 §5.3.1 为准；`reviewStatus` 任意取值均**不得**跳过上述记录。
+- `declarationType` 为 `user_reported` 或 `professionally_confirmed` 时，只要 `status=active` 均硬过滤；区别仅展示、审计与后续专业流程，**不**放宽过滤。
+
+**历史数据兼容**：若存在旧数据 `status=pending_review`，迁移为 `status=active` + `reviewStatus=pending_review`（或复核完成后 `reviewStatus=reviewed`），不得因迁移而短暂放开硬过滤。
+
+**明确问答（与 05 §5.3.1 一致）**：
+
+1. 用户声明已知过敏后是否立即硬过滤？— **是**（`status=active`）。
+2. `reviewStatus=pending_review` 时是否仍硬过滤？— **是**（当且仅当 `status=active`）。
+3. `professionally_confirmed` 与 `user_reported` 是否影响限制生效？— **否**（仅影响性质标注与流程，生效只看 `status`）。
+4. 何时可解除限制？— 用户明确解除或停用：`status=inactive`（及 05 规定的专业安全流程）；不得 AI 自动解除。
+5. 停用后是否重新校验未执行日程？— **是**（§7.0.1 约束 2）。
 
 说明：
 
 - `professionally_confirmed` 只能在有相应专业依据时使用。
 - 用户自行声明不能被系统自动升级为专业确认。
-- 食物名称允许暂时使用文本记录，但应尽量关联标准 FoodItem。
-- 已知禁忌的生效状态必须能够被安全过滤模块读取。
-
-`status`：
-
-- `active`
-- `inactive`
-- `pending_review`（待审核；不参与生产硬过滤直至转为 `active` 或 `inactive`）
+- `foodName` 在缺少 `foodItemId` 时保存用户原意并支持 S1 文本级匹配；应尽量补全 `foodItemId` 或 `allergenId`，但**不得**因未映射而忽略声明。
+- 类别级 `restrictionType` 一期**未**作为 `AllergyItem` 持久化字段；不得将类别级禁忌伪装为 V1 已上线能力。
 
 停用记录应保留历史，不直接物理删除。
 
@@ -1264,7 +1302,7 @@ Recipe 食谱
 | schedule_tasks     | 查询日程任务         | `scheduleId + status`           |
 | schedule_tasks     | 查询档案未来任务     | `profileId + plannedAt`         |
 | task_action_logs   | 查询任务操作历史     | `taskId + createdAt`            |
-| allergy_items      | 查询有效禁忌         | `profileId + status`            |
+| allergy_items      | 查询有效禁忌（S1）   | `profileId + status`（过滤条件 `status=active`） |
 | user_safety_profiles | 查询档案安全头     | `profileId`                     |
 | food_observations  | 查询观察记录         | `profileId + attemptedAt`       |
 | safety_rules       | 查询有效安全规则     | `reviewStatus + effectiveAt`    |

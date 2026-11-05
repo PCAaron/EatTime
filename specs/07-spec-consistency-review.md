@@ -349,6 +349,7 @@
 | C-02 | PRD / 01 / 04 / 06 | 未来 7 天日程  | 生成、补齐和调度定义一致     |
 | C-03 | 01 / 02 / 03       | 内容与任务关联 | 任务能关联具体内容           |
 | C-04 | 02 / 03 / 06       | 内容版本       | 版本实体及关联方式统一       |
+| C-04a | PRD / 02 / 03     | 内容生命周期 status | 与 §5.1.1 / §12 一致，无 reviewing/disabled 等重复枚举 |
 | C-05 | 02 / 04 / 06       | 日程数据结构   | 实体、字段和状态一致         |
 | C-06 | 01 / 02 / 05       | 过敏状态       | 四种状态及含义一致           |
 | C-07 | 02 / 03 / 05       | 已知过敏食物   | 数据、过滤和限制一致         |
@@ -848,3 +849,37 @@ Agent 必须：
 - 直接生成生产代码。
 
 **最终目标：让 PRD 和 01—06 形成一套定义清晰、职责明确、可以追溯、能够被 AI Agent 稳定执行的工程规范。**
+
+---
+
+## 15. P1 定点修复跟踪（F-02 / F-03 / F-04）
+
+| Issue | 主题 | 权威文档 | 修复状态 | 说明 |
+| --- | --- | --- | --- | --- |
+| F-02 | 内容状态枚举及生命周期 | 枚举：02 §5.1.1；迁移与推荐池：03 §12 | RESOLVED | PRD 改为引用；统一 `pending_review`；`expired` 为动态条件非主 status |
+| F-03 | 日程逻辑实体与持久化映射 | 02 §6.0；04 §3.1.1；06 §10.1.0 | RESOLVED | Plan/Day/Slot 非持久化；`ScheduleTask` 增加 `slotCode`；`schedules`↔`ScheduleInstance` |
+| F-04 | 过敏安全双模型 | 02 §7.0；05 §5；06 §10.1.0 | RESOLVED | 仅 `user_safety_profiles`；`AllergyProfile` 为逻辑别名；SAF-08 → 02 §7.0.3 |
+
+### 15.1 修复后检查矩阵（F-02—F-04）
+
+| 检查项 | 预期 | F-02 | F-03 | F-04 |
+| --- | --- | --- | --- | --- |
+| 内容 status 跨 PRD/02/03 一致 | 无独立冲突枚举 | PASS | — | — |
+| 逻辑日程实体均有持久化或非持久化说明 | 无悬空实体 | — | PASS | — |
+| 过敏四种状态单一存储归属 | `UserSafetyProfile.allergyStatus` | — | — | PASS |
+| 05 AllergyRestriction 与 02 可对齐 | 映射 AllergyItem | — | — | PASS |
+| 任务状态 blocked/expired 与 02 对齐 | statusReason 映射 | — | PASS | — |
+
+关联未本轮处理：F-07（06 全量集合与 02 逐一对账）。
+
+### 15.2 人工确认项决议（推荐已写入 Spec）
+
+| 议题 | 推荐方案 | 写入位置 | 状态 |
+| --- | --- | --- | --- |
+| `allergy_profiles` vs `user_safety_profiles` | 仅 `user_safety_profiles`；`allergy_profiles` 废弃 | 02 §7.0、§7.1；06 §10.1.0 | 已采纳 |
+| SAF-08 孕期限制清单 | 后台字典 + `declaredRestrictions[]`；可选、不阻塞日程；自由文本不参与自动过滤 | 02 §7.0.3；05 SAF-08 | 已采纳 |
+| `recipe_versions` vs `content_versions` | 仅 `content_versions` | 06 §10.1.0、§10.1 | 已采纳 |
+| 任务 `blocked`/`expired` vs 02 | 落库 `invalidated`/`cancelled` + `statusReason` | 02 §6.2.1；04 §22；01 §6.3 | 已采纳 |
+| DM-05 / DM-06 | 版本引用 ID + 独立 `allergy_items` | 02 §15 | 已采纳 |
+
+仍须产品/专业输入：DM-01—04、DM-07—12，SAF-01—07、SAF-09—12（字典条目与文案，非数据模型形状）。

@@ -76,7 +76,7 @@
 | 阶段管理域   | PregnancyProfile、ChildProfile、StageSnapshot            | 孕期及幼儿阶段识别           |
 | 内容管理域   | FoodItem、Recipe、RecipeIngredient                       | 食材及食谱内容               |
 | 日程执行域   | ScheduleInstance、ScheduleTask、TaskActionLog            | 日程生成及执行               |
-| 安全管理域   | AllergyProfile、AllergyItem、FoodObservation、SafetyRule | 过敏约束、观察记录及安全规则 |
+| 安全管理域   | UserSafetyProfile、AllergyProfile、AllergyItem、FoodObservation、FoodAllergen、FoodSafetyProfile、RecipeSafetyProfile、SafetyRule | 过敏约束、观察记录及安全规则 |
 | 系统追溯域   | RuleVersion、ContentVersion、BusinessEvent               | 规则、内容版本及业务事件     |
 
 ### 2.2 实体关系总览
@@ -132,7 +132,8 @@ erDiagram
 | ScheduleInstance | 是           | 日程实例           |
 | ScheduleTask     | 是           | 日程任务           |
 | TaskActionLog    | 是           | 任务操作历史       |
-| AllergyProfile   | 是           | 幼儿过敏信息状态   |
+| AllergyProfile   | 是           | 幼儿过敏信息状态（与 UserSafetyProfile 同步，见 §7.0） |
+| UserSafetyProfile | 是        | 每档案用户安全档案（过敏状态权威存储） |
 | AllergyItem      | 是           | 已知过敏食物清单   |
 | FoodObservation  | 是           | 新食物观察记录     |
 | SafetyRule       | 是           | 安全规则           |
@@ -390,6 +391,33 @@ Recipe 食谱
 - 安全相关标签必须有明确的数据来源和审核记录。
 - 不得使用未经核验的营养数据进行精确营养计算。
 
+### 5.1.1 内容生命周期状态（权威枚举）
+
+以下枚举用于 **`Recipe.status`、`FoodItem.status`** 等内容主实体。状态迁移、审核流程及进入生产推荐池条件以 `specs/03-content-spec.md` 第 12 章为准。
+
+| 状态 | 含义 |
+| --- | --- |
+| `draft` | 草稿，尚未提交审核；AI 生成内容默认仅为此状态 |
+| `pending_review` | 已提交审核，等待审核结论 |
+| `approved` | 审核通过，尚未正式发布 |
+| `published` | 已发布；在满足版本审核与有效期条件下可进入生产候选池 |
+| `withdrawn` | 已撤回，禁止进入新的日程候选 |
+| `archived` | 已归档，不再参与新业务 |
+
+与主实体 `status` **分开管理**的状态：
+
+| 层级 | 字段 | 用途 |
+| --- | --- | --- |
+| 内容版本 | `ContentVersion.reviewStatus` | 某一版本快照的审核结论 |
+| 营养数据 | `NutritionData.reviewStatus` | 营养数据核验（含 `expired`，见 03 §9.3） |
+| 审核流水 | `ContentReviewLog.result` | 单次审核结果（如 `rejected`） |
+
+**过期（expired）**：不是内容主实体的持久化 `status` 值；候选过滤时结合 `ContentVersion.expiresAt`、业务时间及营养数据核验状态动态判断。
+
+**审核驳回**：`ContentReviewLog.result = rejected` 后，主实体回到 `draft`（或待编辑后再次提交），不增加独立的 `rejected` 主状态枚举。
+
+**撤回与归档**：`withdrawn` 自生产池撤回并触发未来未执行任务重校验；`archived` 为归档终态。历史 `ScheduleTask` 仍保留生成时的 `contentVersionId`。
+
 ### 5.2 FoodItem 食材实体
 
 用途：维护标准食材信息。
@@ -404,10 +432,12 @@ Recipe 食谱
 | `categoryCode`     | string   | 是   | 食材分类               |
 | `allergenCodes`    | array    | 否   | 已审核的过敏原分类标签 |
 | `textureTags`      | array    | 否   | 质地标签               |
-| `status`           | string   | 是   | 内容状态               |
+| `status`           | string   | 是   | 内容生命周期状态，枚举见 §5.1.1 |
 | `sourceReferences` | array    | 否   | 来源依据               |
 | `createdAt`        | datetime | 是   | 创建时间               |
 | `updatedAt`        | datetime | 是   | 更新时间               |
+
+`FoodItem.status` 与 `Recipe.status` 使用同一套内容生命周期枚举（§5.1.1）。
 
 说明：
 
@@ -438,7 +468,7 @@ Recipe 食谱
 | `textureTags`            | array    | 否   | 质地标签                   |
 | `difficulty`             | string   | 否   | 制作难度                   |
 | `sceneTags`              | array    | 否   | 场景标签                   |
-| `status`                 | string   | 是   | 内容状态                   |
+| `status`                 | string   | 是   | 内容生命周期状态，枚举见 §5.1.1 |
 | `currentVersionId`       | string   | 是   | 当前发布版本               |
 | `createdAt`              | datetime | 是   | 创建时间                   |
 | `updatedAt`              | datetime | 是   | 更新时间                   |
@@ -453,7 +483,7 @@ Recipe 食谱
 
 具体餐次配置以一期日程规则为准。
 
-`status`：
+`status`（与 §5.1.1 一致，此处不再重复释义）：
 
 - `draft`
 - `pending_review`
@@ -556,6 +586,25 @@ Recipe 食谱
 
 ## 6. 日程与任务模型
 
+### 6.0 逻辑实体与持久化映射（权威）
+
+日程业务逻辑层级以 `specs/04-schedule-rules.md` 第 3 章为准；本节定义其与持久化实体及集合的对应关系。不要求每个逻辑层级单独建库表/集合。
+
+| 逻辑实体 | 业务职责 | 是否持久化 | 对应持久化实体 | 数据库集合（见 06） |
+| --- | --- | --- | --- | --- |
+| `SchedulePlan` | 某档案一次「未来 7 天」生成请求的规划边界（含 `generationId`、目标日期范围、规则与内容版本上下文） | 否（生成过程对象） | 由同一 `generationId` 关联的多条 `ScheduleInstance` 共同表达 | — |
+| `ScheduleDay` | 某一自然日下的日程容器 | 否（逻辑分组） | `ScheduleInstance`（`profileId` + `scheduleDate` 唯一标识一日） | `schedule_instances`（06 中别名 `schedules`） |
+| `ScheduleSlot` | 阶段模板定义的餐次/任务槽位（`slotCode`、`mealType` 等） | 否（由模板展开） | 槽位信息落在 `ScheduleTask.slotCode` 等字段 | — |
+| `ScheduleInstance` | 某档案在某自然日的一份已生成日程 | 是 | `ScheduleInstance` | `schedule_instances` |
+| `ScheduleTask` | 用户可执行的具体任务 | 是 | `ScheduleTask` | `schedule_tasks` |
+
+关联约定：
+
+1. `ScheduleTask.scheduleId` 即所属 `ScheduleInstance._id`（亦称 `scheduleInstanceId`）。
+2. `ScheduleTask.slotCode` 必填，用于追溯任务所属业务槽位及幂等键（见 04 §19.1）。
+3. `ScheduleInstance.generationId` 将同一批次生成的多日实例关联为一次 `SchedulePlan`。
+4. 已完成、已跳过、用户主动替换的任务不得被重新生成覆盖；历史任务保留 `contentVersionId`、`ruleVersionId`（及 04 要求的其他版本字段）。
+
 ### 6.1 ScheduleInstance 日程实例
 
 用途：表示某个档案在某一天的一份日程。
@@ -603,10 +652,12 @@ Recipe 食谱
 | 字段                | 类型     | 必填 | 说明             |
 | ------------------- | -------- | ---- | ---------------- |
 | `_id`               | string   | 是   | 任务 ID          |
-| `scheduleId`        | string   | 是   | 所属日程 ID      |
+| `scheduleId`        | string   | 是   | 所属日程实例 ID（同 scheduleInstanceId） |
 | `profileId`         | string   | 是   | 所属档案 ID      |
+| `slotCode`          | string   | 是   | 阶段模板槽位编码 |
 | `taskCode`          | string   | 是   | 任务业务编码     |
 | `mealType`          | string   | 是   | 餐次类型         |
+| `scheduleTemplateVersion` | string | 否 | 生成时日程模板版本 |
 | `recipeId`          | string   | 否   | 当前关联食谱 ID  |
 | `contentVersionId`  | string   | 否   | 当前食谱版本 ID  |
 | `status`            | string   | 是   | 任务状态         |
@@ -616,6 +667,7 @@ Recipe 食谱
 | `originalRecipeId`  | string   | 否   | 最初推荐食谱     |
 | `replacementCount`  | number   | 是   | 替换次数         |
 | `safetyCheckStatus` | string   | 是   | 最近安全校验状态 |
+| `statusReason`      | string   | 否   | 非 pending 时的细粒度原因码，见 §6.2.1 |
 | `createdAt`         | datetime | 是   | 创建时间         |
 | `updatedAt`         | datetime | 是   | 更新时间         |
 
@@ -628,6 +680,16 @@ Recipe 食谱
 - `deferred`
 - `cancelled`
 - `invalidated`
+
+### 6.2.1 任务状态与业务语义映射（权威）
+
+持久化 **`status` 仅使用上列枚举**。`04-schedule-rules.md`、`01-business-flow.md` 中出现的其他名称是 UI 或流程语义，落库时按下表映射，并通过 `statusReason` 保留细节：
+
+| 业务/流程称呼（04 等） | 持久化 `status` | 建议 `statusReason` |
+| --- | --- | --- |
+| `blocked`（安全/内容阻断，待替换） | `invalidated` | `safety_blocked` |
+| `expired`（计划窗口已过且未执行） | `invalidated` 或 `cancelled` | `schedule_expired`（失效）/ 用户放弃用 `cancelled` |
+| 规则或阶段变化导致不可用 | `invalidated` | `rule_changed` / `stage_changed` / `content_withdrawn` |
 
 说明：
 
@@ -688,17 +750,97 @@ Recipe 食谱
 
 ## 7. 过敏及新食物观察模型
 
-### 7.1 AllergyProfile 过敏信息档案
+> 安全判断与过滤流程以 `specs/05-safety-rules.md` 为准。本节为**持久化实体**权威定义；05 中同名概念若未标注为「派生/运行时」，均映射至下表实体。
 
-用途：保存幼儿档案当前的过敏信息状态。
+### 7.0 过敏安全实体与持久化映射（权威）
+
+| 概念 | 实体（02） | 职责 | 集合（06） |
+| --- | --- | --- | --- |
+| 用户安全档案 | `UserSafetyProfile` | 每个 `Profile` 一条；存储四种 `allergyStatus`、孕期 `declaredRestrictions`、档案级安全版本 | `user_safety_profiles` |
+| 已知过敏禁忌项 | `AllergyItem` | 用户声明的已知过敏食物/限制；强制过滤数据源 | `allergy_items` |
+| 新食物观察 | `FoodObservation` | 单次尝试与观察记录 | `food_observations` |
+| 过敏变更历史 | `AllergyChangeLog` | 状态与禁忌清单变更审计 | `allergy_change_logs` |
+| 过敏原字典 | `FoodAllergen` | 标准过敏原及与食材的审核映射 | `food_allergens` |
+| 食材安全属性 | `FoodSafetyProfile` | 食材侧审核后的安全标签（非用户声明） | `food_safety_profiles` |
+| 食谱安全属性 | `RecipeSafetyProfile` | 食谱/版本侧安全审核摘要 | `recipe_safety_profiles` |
+| 安全规则 | `SafetyRule` / `RuleVersion` | 可执行规则及发布版本 | `safety_rules` / `safety_rule_versions` |
+
+**与 05 逻辑命名的映射**：
+
+- `UserSafetyProfile`（05 §5.2）→ 本表 `UserSafetyProfile`。
+- `AllergyRestriction`（05 §5.3）→ 持久化为 `AllergyItem`；05 名称为规则层别名。
+- `FoodAllergen`、`FoodSafetyProfile`、`RecipeSafetyProfile`（05 §5.4—5.6）→ 上表实体；过滤时只读已审核发布数据。
+
+**四种过敏状态存储归属**：仅存于 `UserSafetyProfile.allergyStatus`（枚举见 §7.1）。
+
+**集合决议（已采纳）**：一期**仅**使用集合 `user_safety_profiles` 存储 `UserSafetyProfile`。**不再**新建或读写 `allergy_profiles` 集合。文档中的 `AllergyProfile` 指同一数据的**逻辑别名**（多指幼儿档案场景），不是第二个持久化实体。
+
+**业务域**：孕期与幼儿共用 `UserSafetyProfile`；幼儿已知过敏明细用 `AllergyItem`，观察用 `FoodObservation`。孕期额外限制用 `declaredRestrictions`（结构见 §7.0.3，SAF-08 已采纳一期方案）。
+
+### 7.0.1 UserSafetyProfile 用户安全档案
+
+用途：每个业务档案一条，承载用户声明的过敏信息状态及档案级安全版本。
 
 建议字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `_id` | string | 是 | 安全档案 ID |
+| `profileId` | string | 是 | 对应 Profile |
+| `profileType` | string | 是 | `pregnancy` / `child` |
+| `allergyStatus` | string | 是 | 四种状态，见 §7.1 |
+| `declaredRestrictions` | array | 否 | 用户声明的额外限制项，元素结构见 §7.0.3 |
+| `informationSource` | string | 否 | 信息来源 |
+| `version` | number | 是 | 安全档案版本（变更后递增） |
+| `updatedAt` | datetime | 是 | 更新时间 |
+| `updatedBy` | string | 是 | 修改来源 |
+
+约束：
+
+1. 一个 `Profile` 对应一条 `UserSafetyProfile`。
+2. 修改 `allergyStatus` 或有效 `AllergyItem` 后必须触发未来未执行 `ScheduleTask` 重新校验（见 05）。
+3. `skipped` 不阻塞建档与基础日程；不得与 `none_known` 混用。
+
+### 7.0.2 FoodAllergen / FoodSafetyProfile / RecipeSafetyProfile
+
+`FoodAllergen`：过敏原字典，字段结构见 `03-content-spec.md` §4.4 及 05 §5.4，持久化集合 `food_allergens`。
+
+`FoodSafetyProfile`、`RecipeSafetyProfile`：内容侧安全属性，结构与 05 §5.5—5.6 一致；可与 `ContentVersion` 快照冗余，但生产过滤以已审核发布记录为准。
+
+### 7.0.3 DeclaredRestriction 孕期/档案级声明限制（SAF-08 已采纳）
+
+用途：存储用户从**经专业审核后发布**的限制字典中选择的声明项；不是医学诊断结果，也不替代 `SafetyRule` 硬过滤。
+
+建议元素结构（`UserSafetyProfile.declaredRestrictions[]`）：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `restrictionCode` | string | 是 | 引用后台「孕期限制字典」或已发布 `SafetyRule.ruleCode` |
+| `restrictionType` | string | 是 | `food_avoid` / `category_avoid` / `preparation_limit` / `other_note` |
+| `foodItemId` | string | 否 | 当类型为食物回避时关联标准食材 |
+| `freeTextNote` | string | 否 | 仅 `other_note` 时使用；**不得单独触发自动硬过滤** |
+| `status` | string | 是 | `active` / `inactive` |
+| `declaredAt` | datetime | 是 | 用户声明时间 |
+| `source` | string | 是 | `user_declaration` / `professional_record` |
+
+**一期产品边界（已采纳）**：
+
+1. 具体有哪些 `restrictionCode` 由专业人员在后台维护并随 `SafetyRule` 发布，**不在 Spec 中固化医学禁忌清单**。
+2. 用户声明步骤为**可选**；未填写不影响建档与未来 7 天日程生成（与过敏 `skipped` 同理，但不混用状态）。
+3. 参与 L0 自动过滤的声明：`status=active` 且 `restrictionCode` 对应规则已发布且生效。
+4. `freeTextNote` 仅展示与审计，供专业人员后续处理，不进入自动推荐算法。
+
+### 7.1 AllergyProfile（逻辑别名，非独立集合）
+
+用途：文档与接口中对「幼儿档案过敏信息头」的称呼，**持久化数据即 `UserSafetyProfile`（同 `profileId`）**。读取 `status` 时等同于 `UserSafetyProfile.allergyStatus`。
+
+以下字段表描述与 §7.0.1 同步的语义，**实现不得再写入 `allergy_profiles` 集合**。
 
 | 字段                | 类型     | 必填 | 说明             |
 | ------------------- | -------- | ---- | ---------------- |
 | `_id`               | string   | 是   | 记录 ID          |
 | `profileId`         | string   | 是   | 幼儿档案 ID      |
-| `status`            | string   | 是   | 当前过敏信息状态 |
+| `status`            | string   | 是   | 与 `UserSafetyProfile.allergyStatus` 同义，权威见 §7.0 |
 | `informationSource` | string   | 否   | 信息来源         |
 | `declaredAt`        | datetime | 否   | 用户声明时间     |
 | `updatedAt`         | datetime | 是   | 更新时间         |
@@ -731,7 +873,7 @@ Recipe 食谱
 
 ### 7.2 AllergyItem 已知过敏食物
 
-用途：保存用户声明的已知过敏食物及对应信息。
+用途：保存用户声明的已知过敏食物及对应信息（**对应 05 中的 AllergyRestriction 逻辑**）。
 
 建议字段：
 
@@ -1054,16 +1196,20 @@ Recipe 食谱
 | `food_items`          | FoodItem         | 食材             |
 | `recipes`             | Recipe           | 食谱             |
 | `recipe_ingredients`  | RecipeIngredient | 食谱食材关系     |
-| `content_versions`    | ContentVersion   | 内容版本         |
+| `content_versions`    | ContentVersion   | 内容版本（含食谱，`contentType=recipe`） |
 | `schedule_instances`  | ScheduleInstance | 日程实例         |
 | `schedule_tasks`      | ScheduleTask     | 日程任务         |
 | `task_action_logs`    | TaskActionLog    | 任务操作记录     |
-| `allergy_profiles`    | AllergyProfile   | 过敏信息         |
+| `user_safety_profiles`| UserSafetyProfile | 用户安全档案（唯一过敏状态存储） |
 | `allergy_items`       | AllergyItem      | 已知过敏食物     |
+| `food_allergens`      | FoodAllergen     | 过敏原字典       |
+| `food_safety_profiles`| FoodSafetyProfile | 食材安全属性   |
+| `recipe_safety_profiles` | RecipeSafetyProfile | 食谱安全属性 |
 | `food_observations`   | FoodObservation  | 新食物观察       |
 | `allergy_change_logs` | AllergyChangeLog | 过敏信息变更历史 |
 | `safety_rules`        | SafetyRule       | 安全规则         |
-| `rule_versions`       | RuleVersion      | 规则版本         |
+| `safety_rule_versions`| RuleVersion      | 安全规则版本（06 命名） |
+| `rule_versions`       | RuleVersion      | 规则版本（与 safety_rule_versions 二选一落地） |
 | `business_events`     | BusinessEvent    | 业务事件         |
 
 ### 11.1 是否需要拆分集合
@@ -1107,8 +1253,8 @@ Recipe 食谱
 | schedule_tasks     | 查询日程任务         | `scheduleId + status`           |
 | schedule_tasks     | 查询档案未来任务     | `profileId + plannedAt`         |
 | task_action_logs   | 查询任务操作历史     | `taskId + createdAt`            |
-| allergy_profiles   | 查询档案过敏状态     | `profileId`                     |
 | allergy_items      | 查询有效禁忌         | `profileId + status`            |
+| user_safety_profiles | 查询档案安全头     | `profileId`                     |
 | food_observations  | 查询观察记录         | `profileId + attemptedAt`       |
 | safety_rules       | 查询有效安全规则     | `reviewStatus + effectiveAt`    |
 | content_versions   | 查询内容版本         | `contentId + version`           |
@@ -1228,8 +1374,8 @@ Recipe 食谱
 | DM-02 | 孕期具体孕周计算口径                                                 | PregnancyProfile、StageSnapshot | 阶段规则 Spec   |
 | DM-03 | 2 岁左右幼儿的一期月龄边界                                           | ChildProfile、StageSnapshot     | 阶段规则 Spec   |
 | DM-04 | 一期食谱营养数据需要采集到什么程度                                   | Recipe                          | 内容 Spec       |
-| DM-05 | 食谱内容版本快照保存完整字段还是引用不可变内容                       | ContentVersion                  | 技术架构 Spec   |
-| DM-06 | AllergyItem 是否独立集合                                             | AllergyItem                     | 技术架构 Spec   |
+| DM-05 | 食谱内容版本快照保存完整字段还是引用不可变内容                       | ContentVersion                  | **已采纳**：快照 + 关键字段冗余；历史任务只存 `contentVersionId` |
+| DM-06 | AllergyItem 是否独立集合                                             | AllergyItem                     | **已采纳**：一期独立集合 `allergy_items` |
 | DM-07 | 观察中的食物是否允许进入推荐候选                                     | FoodObservation、SafetyRule     | 安全规则 Spec   |
 | DM-08 | 疑似反应后是否自动将食物加入禁忌清单，及其状态表达                   | AllergyItem、FoodObservation    | 安全规则 Spec   |
 | DM-09 | 日程重新生成时，已替换任务如何处理                                   | ScheduleInstance、ScheduleTask  | 日程规则 Spec   |

@@ -279,7 +279,7 @@ FoodItem 表示一个标准食材。
 
 ### 4.5 食材状态
 
-建议状态：
+枚举与 `Recipe.status` 相同，权威定义见 `specs/02-data-model.md` §5.1.1。本章仅保留业务释义：
 
 - `draft`：草稿。
 - `pending_review`：待审核。
@@ -904,6 +904,8 @@ Recipe 表示一条经过结构化维护的标准食谱。
 
 ## 12. 内容状态与发布规范
 
+> **枚举权威**：`Recipe.status`、`FoodItem.status` 的持久化取值以 `specs/02-data-model.md` §5.1.1 为准。本章定义生命周期含义、状态迁移及推荐池规则。
+
 ### 12.1 内容状态机
 
 建议状态：
@@ -939,6 +941,32 @@ published
 - `rejected`：审核未通过。
 - `withdrawn`：已撤回。
 - `archived`：已归档。
+
+**命名对照（勿再使用）**：PRD 旧称 `reviewing` → `pending_review`；旧称内容 `disabled` → `withdrawn` 或 `archived`（按业务选择，不用用户/档案的 `disabled`）。
+
+**分层提醒**：营养数据 `reviewStatus` 中的 `expired`（§9.3）与主实体 `status` 无关；主实体不设 `expired` 枚举值。
+
+### 12.1.1 合法状态迁移与触发条件
+
+| 迁移 | 触发条件 |
+| --- | --- |
+| `draft` → `pending_review` | 编辑提交审核 |
+| `pending_review` → `approved` | 审核通过 |
+| `pending_review` → `draft` | 审核驳回（`ContentReviewLog.result = rejected`）或撤回提交 |
+| `approved` → `published` | 发布审批通过 |
+| `published` → `withdrawn` | 内容撤回（安全/依据/适用性等问题） |
+| `published` → `archived` | 内容下线归档 |
+| `withdrawn` → `archived` | 撤回后长期不再使用 |
+
+禁止：AI 自动将状态改为 `approved` 或 `published`；未经审核进入 `published`。
+
+### 12.1.2 撤回、归档、过期对未来日程的影响
+
+| 情况 | 对新候选池 | 对未来未执行 `ScheduleTask` | 对历史已完成任务 |
+| --- | --- | --- | --- |
+| `withdrawn` | 禁止进入 | 触发重校验/替换流程 | 保留原 `contentVersionId` |
+| `archived` | 禁止进入 | 不再安排新任务 | 保留追溯 |
+| 版本/营养 `expired`（动态） | 视为不满足 §12.2 条件 | 重校验未执行任务 | 不变 |
 
 ### 12.2 进入生产推荐池的条件
 

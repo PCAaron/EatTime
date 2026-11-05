@@ -793,6 +793,25 @@ cloud database
 
 ## 10. 云数据库设计
 
+### 10.1.0 集合与 02 持久化实体映射（权威）
+
+| 集合 | 02 实体 | 说明 |
+| --- | --- | --- |
+| `schedules` | `ScheduleInstance` | 与 02 建议名 `schedule_instances` 同义，择一落地 |
+| `schedule_tasks` | `ScheduleTask` | 含 `scheduleId`、`slotCode` |
+| `user_safety_profiles` | `UserSafetyProfile` | 四种 `allergyStatus` 唯一存储归属 |
+| `allergy_items` | `AllergyItem` | 用户已知过敏禁忌（05 逻辑名 AllergyRestriction） |
+| `allergy_profiles` | — | **已废弃**；历史数据应迁移至 `user_safety_profiles` |
+| `food_observations` | `FoodObservation` | 新食物观察 |
+| `food_allergens` | `FoodAllergen` | 过敏原字典 |
+| `food_safety_profiles` | `FoodSafetyProfile` | 食材侧安全属性 |
+| `recipe_safety_profiles` | `RecipeSafetyProfile` | 食谱侧安全属性 |
+| `content_versions` | `ContentVersion` | 唯一内容版本集合；食谱即 `contentType=recipe` |
+| `recipe_versions` | — | **已废弃**；与 `content_versions` 不得并存，新实现勿用 |
+| `safety_rules` / `safety_rule_versions` | `SafetyRule` / `RuleVersion` | 与 02 规则版本对齐 |
+
+`SchedulePlan`、`ScheduleDay`、`ScheduleSlot` 不单独建集合（02 §6.0、04 §3.1.1）。内容 `status` 枚举见 02 §5.1.1。
+
 ### 10.1 数据集合分类
 
 以下为建议集合清单，最终必须与 `02-data-model.md` 合并，避免出现重复实体或字段定义冲突。
@@ -814,7 +833,7 @@ cloud database
 | `food_categories`    | 食材分类     |
 | `food_allergens`     | 过敏原字典   |
 | `recipes`            | 食谱基础信息 |
-| `recipe_versions`    | 食谱版本     |
+| `content_versions`   | 食谱等内容版本（`ContentVersion`，含 `contentType=recipe`） |
 | `recipe_ingredients` | 食谱食材关系 |
 | `source_references`  | 内容依据来源 |
 
@@ -822,8 +841,8 @@ cloud database
 
 | 集合                     | 用途         |
 | ------------------------ | ------------ |
-| `user_safety_profiles`   | 用户安全档案 |
-| `allergy_restrictions`   | 用户过敏禁忌 |
+| `user_safety_profiles`   | 用户安全档案（`UserSafetyProfile`） |
+| `allergy_items`          | 用户已知过敏禁忌（`AllergyItem`）   |
 | `food_safety_profiles`   | 食材安全属性 |
 | `recipe_safety_profiles` | 食谱安全属性 |
 | `safety_rules`           | 安全规则     |
@@ -834,7 +853,7 @@ cloud database
 
 | 集合                       | 用途         |
 | -------------------------- | ------------ |
-| `schedules`                | 日程实例     |
+| `schedules`                | 日程实例（`ScheduleInstance`，同 02 `schedule_instances`） |
 | `schedule_tasks`           | 日程任务     |
 | `task_operation_logs`      | 任务操作记录 |
 | `schedule_generation_logs` | 日程生成记录 |

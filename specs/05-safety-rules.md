@@ -218,6 +218,8 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 ## 5. 安全规则数据模型
 
+> **持久化权威**：`specs/02-data-model.md` §7.0。本节为规则执行视角的逻辑模型；`AllergyRestriction` 等名称若与 02 实体不同，按 §7.0 映射表转换为持久化读写。
+
 以下是建议的逻辑模型。实际字段需要与 `02-data-model.md` 和 `03-content-spec.md` 合并，避免重复建设。
 
 ### 5.1 SafetyRule
@@ -248,7 +250,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 ### 5.2 UserSafetyProfile
 
-用户安全档案。
+用户安全档案（**持久化**：`UserSafetyProfile`，集合 `user_safety_profiles`，见 02 §7.0.1）。
 
 一个 Profile 对应独立的安全档案，不允许将不同孕期或幼儿档案的过敏信息混用。
 
@@ -259,10 +261,10 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 | safetyProfileId      | string   | 安全档案 ID        |
 | profileId            | string   | 对应用户业务档案   |
 | domain               | enum     | pregnancy / child  |
-| allergyStatus        | enum     | 过敏状态           |
-| declaredRestrictions | array    | 用户声明的饮食限制 |
-| knownAllergies       | array    | 已知过敏食物       |
-| observations         | array    | 食物观察记录       |
+| allergyStatus        | enum     | 过敏状态（**唯一存储归属**，与 02 一致） |
+| declaredRestrictions | array    | 用户声明的额外限制，元素结构见 02 §7.0.3 |
+| knownAllergies       | array    | 已知过敏食物（**查询时以 AllergyItem 为准**，此字段可为展示冗余） |
+| observations         | array    | 食物观察（**持久化以 FoodObservation 为准**） |
 | source               | enum     | 信息来源           |
 | updatedAt            | datetime | 最近更新时间       |
 | version              | number   | 安全档案版本       |
@@ -278,7 +280,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 ### 5.3 AllergyRestriction
 
-过敏禁忌记录。
+过敏禁忌记录（**逻辑命名**；**持久化实体为 `AllergyItem`**，集合 `allergy_items`，见 02 §7.2）。
 
 | 字段              | 说明                               |
 | ----------------- | ---------------------------------- |
@@ -304,7 +306,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 ### 5.4 FoodAllergen
 
-过敏原字典。
+过敏原字典（**持久化**：`FoodAllergen`，集合 `food_allergens`，见 02 §7.0.2）。
 
 | 字段             | 说明              |
 | ---------------- | ----------------- |
@@ -328,7 +330,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 ### 5.5 FoodSafetyProfile
 
-食材安全属性。
+食材安全属性（**持久化**：`FoodSafetyProfile`，集合 `food_safety_profiles`；与 `FoodItem.allergenCodes` 等内容标签区分，见 02 §7.0.2）。
 
 | 字段                    | 说明                 |
 | ----------------------- | -------------------- |
@@ -348,7 +350,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 ### 5.6 RecipeSafetyProfile
 
-食谱安全属性。
+食谱安全属性（**持久化**：`RecipeSafetyProfile`，集合 `recipe_safety_profiles`，见 02 §7.0.2）。
 
 | 字段                   | 说明           |
 | ---------------------- | -------------- |
@@ -1236,7 +1238,7 @@ AI 不可以：
 | SAF-05 | 交叉接触风险的分类和阻断策略           | 专业审核人员          | 食谱过滤     |
 | SAF-06 | 幼儿质地标签和适用范围                 | 儿科/营养专业人员     | 幼儿食谱审核 |
 | SAF-07 | 幼儿特殊进食能力的产品处理方式         | 产品、专业审核人员    | 特殊场景     |
-| SAF-08 | 孕期特殊饮食限制清单                   | 产科/营养专业人员     | 孕期规则     |
+| SAF-08 | 孕期特殊饮食限制清单                   | 产科/营养专业人员     | 孕期规则     | **已采纳（一期）**：字典 + `DeclaredRestriction` 结构见 02 §7.0.3；Spec 不固化具体禁忌条目 |
 | SAF-09 | 疑似严重反应的提示文案和触发条件       | 医疗专业人员          | 紧急提示     |
 | SAF-10 | 用户修改或解除过敏禁忌的交互及审核流程 | 产品、专业审核人员    | 安全档案     |
 | SAF-11 | 安全规则发布和回滚权限                 | 产品、技术            | 后台权限     |

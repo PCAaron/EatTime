@@ -97,6 +97,20 @@ Profile
 
 实际字段应与 `02-data-model.md` 统一。如果现有数据模型中的实体名称不同，应优先沿用已确定的数据模型，不要在本 Spec 中重复创建同义实体。
 
+### 3.1.1 逻辑实体与持久化映射
+
+完整字段定义以 `02-data-model.md` §6.0 为准；数据库集合命名以 `06-technical-architecture.md` §10 为准。
+
+| 逻辑实体 | 业务职责 | 是否持久化 | 持久化实体 | 数据库集合 |
+| --- | --- | --- | --- | --- |
+| `SchedulePlan` | 某档案一次未来 7 天生成规划（`generationId`、日期范围、版本上下文） | 否 | 同一 `generationId` 下多条 `ScheduleInstance` | — |
+| `ScheduleDay` | 单日日程容器 | 否 | `ScheduleInstance`（`profileId` + `scheduleDate`） | `schedule_instances` / `schedules` |
+| `ScheduleSlot` | 模板槽位在某日的展开 | 否 | `ScheduleTask.slotCode`、`mealType` 等 | — |
+| `ScheduleInstance` | 档案在某自然日的日程实例 | 是 | `ScheduleInstance` | `schedule_instances` |
+| `ScheduleTask` | 用户执行任务 | 是 | `ScheduleTask`（`scheduleId` + `slotCode` 追溯实例与槽位） | `schedule_tasks` |
+
+一期生成未来 7 天：写入/补齐 7 个日期的 `ScheduleInstance` 及各槽位 `ScheduleTask`；幂等与不可覆盖规则见 §6.1、§19。
+
 ### 3.2 两个业务域
 
 日程引擎共享基础能力，但孕期与幼儿喂养必须保持独立的业务规则。
@@ -1014,21 +1028,28 @@ profileId + scheduleDate + slotCode + generationVersion
 
 ## 22. 日程状态机
 
-### 22.1 任务状态
+> **持久化权威**：`ScheduleTask.status` 及 `statusReason` 以 `02-data-model.md` §6.2、§6.2.1 为准。本章 `blocked`、`expired` 为**流程/UI 语义**，落库时映射为 `invalidated`（或 `cancelled`）并写入 `statusReason`。
 
-建议状态：
+### 22.1 任务状态（持久化枚举）
 
-| 状态      | 含义       |
-| --------- | ---------- |
-| pending   | 待执行     |
-| completed | 已完成     |
-| skipped   | 已跳过     |
-| deferred  | 已顺延     |
-| replaced  | 已替换     |
-| blocked   | 已阻止执行 |
-| expired   | 已过期     |
+与 02 一致：
 
-状态名称应与 `02-data-model.md` 统一。
+| 状态 | 含义 |
+| --- | --- |
+| `pending` | 待执行 |
+| `completed` | 已完成 |
+| `skipped` | 已跳过 |
+| `deferred` | 已顺延 |
+| `replaced` | 已替换（原任务保留，新推荐另记） |
+| `cancelled` | 已取消，不再执行 |
+| `invalidated` | 因安全、内容、规则或计划窗口等原因失效 |
+
+### 22.1.1 流程语义映射（非持久化 status 值）
+
+| 流程称呼 | 落库 `status` | `statusReason` |
+| --- | --- | --- |
+| `blocked` | `invalidated` | `safety_blocked` |
+| `expired` | `invalidated` 或 `cancelled` | `schedule_expired` |
 
 ### 22.2 状态流转
 
@@ -1038,12 +1059,12 @@ pending
   ├── skipped
   ├── deferred
   ├── replaced
-  └── blocked
+  └── invalidated（流程中称 blocked：安全/内容阻断）
 
 deferred
   ├── pending（目标日期重新生成并通过校验）
-  ├── blocked
-  └── expired
+  ├── invalidated
+  └── invalidated（流程中称 expired：schedule_expired）
 
 replaced
   └── 保留替换关系，不覆盖原始记录
@@ -1054,11 +1075,13 @@ completed
 skipped
   └── 保留历史状态，通过新操作创建新的安排
 
-blocked
-  └── 重新通过安全与阶段校验后创建新的有效任务
+invalidated
+  └── 重新通过安全与阶段校验后创建新的有效任务（原任务保留审计）
 ```
 
-实际状态机需要根据 `02-data-model.md` 的既有状态定义进行合并，不能出现同一业务含义多个状态名称。
+持久化不得再使用 `blocked`、`expired` 作为 `ScheduleTask.status` 字段值。
+
+实际状态机以 `02-data-model.md` §6.2.1 为准。
 
 ## 23. 日程引擎接口边界
 

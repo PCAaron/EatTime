@@ -178,14 +178,27 @@
 
 ### 内容状态
 
-- draft：草稿
-- reviewing：审核中
-- approved：审核通过
-- published：已发布
-- disabled：已停用
-- expired：已过期
+内容生命周期状态不在 PRD 中独立维护枚举，权威定义如下：
 
-只有符合发布条件的内容可以进入生产推荐池。
+- **持久化枚举**（`Recipe.status`、`FoodItem.status`）：见 `specs/02-data-model.md` 第 5 章。
+- **状态含义、迁移规则及进入生产推荐池条件**：见 `specs/03-content-spec.md` 第 12 章。
+
+产品层摘要（与上述 Spec 一致）：
+
+| 状态 | 含义 |
+| --- | --- |
+| `draft` | 草稿，未提交审核；AI 生成内容默认仅为此状态 |
+| `pending_review` | 已提交，待审核 |
+| `approved` | 审核通过，尚未发布 |
+| `published` | 已发布，在满足版本与有效期条件下可进入生产候选池 |
+| `withdrawn` | 已撤回，不得进入新日程候选 |
+| `archived` | 已归档，不再用于新业务 |
+
+说明：
+
+- 内容是否「过期」不由单独的 `expired` 实体状态表示，而依据 `ContentVersion.effectiveAt` / `expiresAt` 及营养数据核验状态动态判断（见 `03-content-spec.md`）。
+- `withdrawn` 与档案/用户的 `disabled` 等不同属不同领域状态，不得混用。
+- 未经审核的内容不得进入生产推荐池；AI 不得自动审核或发布。
 
 ### 内容版本管理
 

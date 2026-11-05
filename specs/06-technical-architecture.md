@@ -714,10 +714,10 @@ SafetyCheckResult
 | AllergyChangeLog 写入失败 | 整事务回滚，`status` 仍为 `active` |
 | Outbox Job 创建失败 | 整事务回滚，不得单独留下 `inactive` + success |
 | 事务提交后 Worker 未运行 | Job 仍为 `pending`，可扫描恢复 |
-| Worker 执行中崩溃 | Job 可重新领取（见 §14.4），不丢失 |
-| 重复消费同一 Job | 不重复产生错误任务副作用（§14.4 幂等） |
+| Worker 执行中崩溃 | Job 租约到期后可回收并重新领取（§14.4）；旧 Worker 失去执行权后不得写入下游 |
+| 重复消费同一 Job | 不重复产生错误任务副作用（§14.4 幂等 + `claimVersion` 隔离） |
 | 重校验持续失败 | 保留 `lastError`、`retryCount`，达上限进 `failed` |
-| 系统重启 | 扫描 `pending` / 超时 `processing` 恢复 |
+| 系统重启 | 扫描 `pending` / **租约过期**的 `processing` 回收（§14.4）；**不得**仅凭 `updatedAt` 代替租约判断 |
 
 安全信息发生变化时（含 Worker 完成的过敏解除重校验）：
 
@@ -1199,6 +1199,7 @@ BackgroundJob
   - retryCount / attempts
   - nextRetryAt
   - lastError / lastErrorCode
+  - leaseOwner / leaseExpiresAt / claimVersion（执行租约与 fencing token，02 §7.4.1、§14.4）
   - createdAt
   - updatedAt
   - completedAt
@@ -1214,26 +1215,135 @@ BackgroundJob
 
 具体字段需与实际任务执行方案保持一致；**过敏解除日程重校验**的字段语义以 02 §7.4.1 为准。
 
-### 14.4 过敏解除日程重校验 Worker（F-04.3.2）
+### 14.4 过敏解除日程重校验 Worker（F-04.3.2 / F-04.3.3）
 
-**领取**：Worker（`scheduler` 或 `safety`）须通过 **条件更新** 将 Job 从 `pending`（且 `nextRetryAt` 为空或 ≤ 当前时间）置为 `processing`，并记录 `updatedAt`；**仅当**影响记录数 = 1 时视为领取成功，避免多 Worker 重复执行。
+**权威时间**：租约是否有效、是否可回收、续期后的到期时间，均以**服务端当前时间**为准；Worker 本地时钟 **不得**作为租约判断依据。
 
-**执行范围**：
+**可配置参数（实施阶段配置并文档化；下列为待验证的建议默认值，非业务事实）**：
+
+| 参数 | 含义 | 建议默认（待实现验证） |
+| --- | --- | --- |
+| `leaseDuration` | 单次租约时长 | 如 5 分钟 |
+| `leaseRenewInterval` | 长任务续期间隔（须 `< leaseDuration`） | 如 1 分钟 |
+| `leaseReclaimScanInterval` | 过期租约扫描周期 | 如 1 分钟 |
+
+#### 14.4.1 原子领取（Claim）
+
+Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update」。领取 **必须**为**单次条件更新**（Compare-And-Set），过滤条件 **同时**包含：
+
+1. `_id = jobId`
+2. `status = pending`
+3. `nextRetryAt` 为空或 ≤ 服务端当前时间
+4. **不存在有效租约**：`leaseOwner = null` 且 `leaseExpiresAt = null`（或与 02 §7.4.1 未领取初始态一致）
+
+更新字段 **在同一原子操作中**：
+
+1. `status = processing`
+2. `leaseOwner = <本 Worker 实例唯一 ID>`
+3. `leaseExpiresAt = serverNow + leaseDuration`
+4. `claimVersion = claimVersion + 1`（读-改-写须在数据库原子语义内完成）
+5. `updatedAt = serverNow`
+
+**仅当**影响记录数 = 1 时领取成功；Worker **必须**记录返回的 `claimVersion`（若平台不返回新文档，则领取后立即按 `_id` 读取 `claimVersion`，仍视为同一次成功领取的会话）。影响记录数 = 0 时 **不得**执行该 Job 的任何业务逻辑。
+
+并发领取：多个 Worker 对同一 Job 仅 **一个** 条件更新成功。
+
+#### 14.4.2 租约续期（Renew）
+
+长任务 **必须**在 `leaseRenewInterval` 周期内尝试续期。续期 **必须**为条件更新，过滤条件 **同时**包含：
+
+- `_id = jobId`
+- `status = processing`
+- `leaseOwner = 本 Worker ID`
+- `claimVersion = 本 Worker 持有的版本`
+- `leaseExpiresAt > serverNow`（**禁止**对已过期租约续期「复活」）
+
+更新：`leaseExpiresAt = serverNow + leaseDuration`，`updatedAt = serverNow`。
+
+- 续期成功：可继续业务写入（仍须遵守 §14.4.4 每条写入前的执行权校验）。
+- 续期失败（影响 0）或网络结果未知：**不得**假设仍持有租约；须重新读取 Job 或再次条件校验；**立即停止**新的 `ScheduleTask` 及重校验结果写入；仅允许只读诊断。
+
+#### 14.4.3 过期回收与重新领取
+
+**回收（Reclaim）** — 针对僵死或超时 Worker，**不能**假设旧 Worker 已停止：
+
+条件更新过滤：
+
+- `status = processing`
+- `leaseExpiresAt <= serverNow`（租约 **已** 过期）
+
+更新：
+
+- `status = pending`（若同时触发重试退避，可写 `nextRetryAt` 且保持 `pending`）
+- `leaseOwner = null`，`leaseExpiresAt = null`
+- 按策略 `retryCount` 递增或仅 `updatedAt` 更新（**不得**在此步写 `completed` / `failed` 业务结论）
+- **不修改** `claimVersion`（旧 Worker 仍可能持有旧版本号，但 Job 已非其租约下的 `processing` 且版本将在下次领取时被递增淘汰）
+
+**仅当**影响记录数 = 1 时回收成功；多回收 Worker 并发时只有一个成功。
+
+**重新领取**：回收后的 Job 走 §14.4.1 领取流程，**必须**再次递增 `claimVersion` 并写入新 `leaseOwner` / `leaseExpiresAt`。旧 Worker 持有的 `(leaseOwner, claimVersion)` **立即**失去对 Job 状态与下游写入的有效性。
+
+**禁止**：在未递增 `claimVersion`、未设置新租约的情况下，允许第二个 Worker 并行执行同一 Job 的业务副作用。
+
+**与「processing → pending 退避」的区别**：可恢复失败时，**当前有效租约持有者**在 §14.4.5 中主动释放租约并置 `pending`；过期回收 **无** 有效租约，由扫描器发起。
+
+#### 14.4.4 执行权隔离与下游写入（F-04.3.3 核心）
+
+**原则**：失去租约或 `claimVersion` 已落后的 Worker，**不得**产生任何持久化业务副作用（含 `ScheduleTask` 更新、重校验结果、`TaskActionLog` 追加等）。**禁止**「BackgroundJob 终态更新失败但 ScheduleTask 已被旧 Worker 写入」。
+
+**执行权校验（每次持久化写操作前均须满足，不得仅在任务开始或仅在 Job 完成时校验一次）**：
+
+| 校验项 | 要求 |
+| --- | --- |
+| Job 状态 | `status = processing` |
+| 租约归属 | `leaseOwner` = 本 Worker ID |
+| Fencing | `claimVersion` = 本 Worker 持有的版本 |
+| 租约时效 | `leaseExpiresAt > serverNow` |
+
+**BackgroundJob 状态变更**（完成、失败、退避、错误信息、`retryCount`、`nextRetryAt`）：**必须**使用与 §14.4.4 相同的条件字段（`_id` + `status=processing` + `leaseOwner` + `claimVersion` + 租约未过期）。旧 Worker 延迟提交完成 **必须**因 `claimVersion` 不匹配或租约失效而拒绝（影响 0）。
+
+**ScheduleTask 重校验写入**：
+
+1. **首选**：在同一**数据库事务**内（平台支持时）：先对 `background_jobs` 做 §14.4.4 执行权条件更新（可为「touch `updatedAt`」或续期），再对目标 `schedule_tasks` 做条件更新（`profileId` 匹配、`status` 为未执行态如 `pending`、计划时间在未来等业务条件见 04 §9.5 / 05 §5.3.1）。任一步失败则整事务回滚。
+2. **若当前微信云开发环境无法跨集合原子事务**：**必须**采用「单条 `schedule_tasks` 条件更新 + 同一云函数调用内、写入前 **同步** 执行 BackgroundJob 执行权条件读/更新；若 Job 校验影响 0，**不得**写入该任务」。该路径在实现评审中须标记为依赖单函数串行化，并通过集成测试验证无双 Worker 副作用；规格层结论见 07 §15.8。
+3. **幂等**：同一 Job 对同一 `ScheduleTask` 的重复重校验写入须保持业务幂等（§14.4 执行范围）；执行权隔离 **补充** 幂等，**不替代** `idempotencyKey`。
+
+**读操作**：扫描未来任务可为只读；**任何**改变 `ScheduleTask` 或写入重校验结论的 operation 均受本节约束。
+
+#### 14.4.5 完成、失败与重试
+
+**成功完成**：在 §14.4.4 条件满足的前提下，条件更新 Job → `completed`，写入 `completedAt`，释放租约（`leaseOwner=null`，`leaseExpiresAt=null`）；可 emit `safety_revalidation_completed`（05 事件表）。
+
+**可恢复失败**：须先满足 §14.4.4，再在同一条件更新中：`retryCount` 递增，计算 `nextRetryAt`（指数退避，最大次数等见下），`status=pending`，**释放租约**。
+
+**超过最大重试或不可恢复错误**：条件更新 → `status=failed`，写入 `lastError` / `retryCount`，释放租约；**禁止**静默删除。
+
+**人工恢复**：管理端或运维 API 须支持对 `failed` Job 重新置 `pending`（新 `operationId` **不**要求；仍关联原解除 `operationId`）或创建补偿 Job；须审计；清空租约字段，**不重置** `claimVersion`。
+
+**退避参数（可配置，建议默认待实现验证）**：最大重试 **5** 次、`baseDelay` 1 分钟、指数退避；`retry_wait` 与 `pending` + `nextRetryAt` 二选一落地。
+#### 14.4.6 执行范围（业务，F-04.3.2 保持不变）
 
 1. 仅重校验该 `profileId` 下 **未来尚未执行** 的 `ScheduleTask`（与 04 §9.5、05 §5.3.1 一致）。
 2. **不得**修改已完成历史 `ScheduleTask`。
 3. **不得**绕过 S1 过敏过滤（05 §5.3.2）。
-4. 执行逻辑须 **幂等**：同一 Job 重复消费不得重复错误阻断或重复写入矛盾状态。
+4. 执行逻辑须 **幂等**：同一 Job 重复消费不得重复错误阻断或重复写入矛盾状态（在 **当前** `claimVersion` 持有者下）。
 
-**成功**：将 Job 置 `completed`，写入 `completedAt`；可 emit `safety_revalidation_completed`（05 事件表）。
+#### 14.4.7 异常场景（租约与执行权）
 
-**失败与重试**：
+| 场景 | 触发条件 | Job / 租约变化 | 是否允许业务写入 | 恢复 |
+| --- | --- | --- | --- | --- |
+| Worker 正常完成 | 重校验结束 | 条件 → `completed`，释放租约 | 完成前最后一批写入须 §14.4.4 | — |
+| Worker 崩溃 | 进程退出 | 租约到期后 §14.4.3 回收 | 崩溃后旧 Worker 无写入权 | 扫描回收 + 重新领取 |
+| 执行超过租约 | 未续期 | 过期后回收；或续期成功则延长 | 续期失败则停止写入 | 续期 / 回收 |
+| A 过期，B 重新领取 | `leaseExpiresAt` 到期 | B 领取 `claimVersion++` | A **禁止**；B 在 §14.4.4 下允许 | 自动 |
+| A 失租约后尝试写入 | A 版本过期或租约失效 | 无 Job 更新 | **拒绝**（影响 0） | A 应退出 |
+| 两 Worker 同时领取 | 并发 CAS | 一者成功递增版本 | 失败者 **禁止** | — |
+| 两 Worker 同时回收 | 并发 CAS | 一者成功置 `pending` | 回收过程无业务写入 | — |
+| A 延迟提交完成 | B 已领取或已完成 | CAS 失败 | **拒绝** | 人工查 Job 状态 |
+| 续期结果未知 | 网络超时 | 不得假设成功 | **暂停写入**直至重新确认执行权 | 重读 Job 或重试续期 |
+| 重复处理同一 Job | 重试 / 重新领取 | 版本递增 | 仅当前版本持有者；业务幂等仍生效 | §14.4.1 / §14.4.3 |
 
-- 可恢复错误：`retryCount` 递增，计算 `nextRetryAt`（指数退避，参数在实施配置中定义，**须**文档化默认值建议：如最大 **5** 次、`baseDelay` 1 分钟），状态回 `pending` 或 `retry_wait`。
-- 超过最大重试次数或不可恢复错误：`status=failed`，保留 `lastError` 与 `retryCount`，**禁止**静默删除。
-- **人工恢复**：管理端或运维 API 须支持对 `failed` Job 重新置 `pending`（新 `operationId` **不**要求；仍关联原解除 `operationId`）或创建补偿 Job；须审计。
-
-**系统重启**：启动时扫描 `pending` 及超时未更新的 `processing`（超时阈值须配置，如 15 分钟），将僵死 `processing` 重置为可领取状态并递增 `retryCount` 或按策略标记失败。
+**系统重启**：启动时扫描 `pending` 及 **租约过期**的 `processing`（§14.4.3），**不得**仅按 `updatedAt` 阈值回收而忽略 `leaseExpiresAt`。
 
 **与 AllergyChangeLog 的边界**：Worker **不得**更新 append-only `AllergyChangeLog` 以反映进度；进度仅存在于 `background_jobs`。
 

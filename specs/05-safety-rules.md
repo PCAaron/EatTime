@@ -578,8 +578,10 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 3. 在 `status=active` 期间（含 `reviewStatus=rejected`），S1 **继续**硬过滤。
 4. **仅**用户在产品内完成明确解除确认（及 SAF-10 规定的安全流程）后，方可将 `status` 更新为 `inactive`。
 5. 解除 **必须** 与 `outcome=success` 的 `AllergyChangeLog` **原子提交**（同一数据库事务或 06 §8.4 等效机制）；**缺少必填审计字段或事务未提交成功，均视为解除未成功**，不得将 `AllergyItem.status` 持久化为 `inactive`。
-6. 解除后须重新校验未来未执行 `ScheduleTask`（§5.3.1、04 §9.5）；已执行历史不得追溯修改；审计须能关联本次解除触发的重校验（`revalidationTriggered` / `revalidationReference`）。
-7. `outcome=success` **仅当** `AllergyItem.status` 已成功持久化为 `inactive` 时写入；须携带幂等 `operationId`（02 §7.4）；重复请求不得重复解除或产生矛盾成功记录（见 06 §8.4）。
+6. 解除后须重新校验未来未执行 `ScheduleTask`（§5.3.1、04 §9.5）；已执行历史不得追溯修改。重校验 **必须** 通过持久化 `BackgroundJob`（02 §7.4.1、06 §8.4 Transactional Outbox）触发；`AllergyChangeLog.revalidationReference` 指向该 Job，**禁止**在审计日志 append-only 写入后补改重校验状态。
+7. `outcome=success` **仅当** `AllergyItem.status` 已成功持久化为 `inactive` 时写入；须携带幂等 `operationId`（02 §7.4）；重复请求不得重复解除或产生矛盾成功记录（见 06 §8.4、§8.4.1）。
+8. **`operationId` 与并发（F-04.3.2）**：幂等键 `(profileId, allergyItemId, operationId)` 须由数据库唯一索引保障（02 §7.4、§12）。解除须条件更新 `status=active` 并校验影响记录数；影响 `0` 时 **不得** 写入 `outcome=success`。不同 `operationId` 并发解除同一禁忌项时，仅一个请求可完成状态变更与 success 审计。
+9. **幂等重试**：相同 `operationId` 的成功重放须返回原结果并验证 `inactive` + 已有 success 日志；**不得**将「查到 operationId」 alone 等同于成功。处理中、失败重试与并发冲突语义见 02 §7.4 表与 06 §8.4.1。
 
 **执行者与用户确认（不得用 `source` 替代）**：
 

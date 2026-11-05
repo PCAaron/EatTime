@@ -434,7 +434,7 @@ Recipe 食谱
 | `name`             | string   | 是   | 食材名称               |
 | `aliases`          | array    | 否   | 别名                   |
 | `categoryCode`     | string   | 是   | 食材分类               |
-| `allergenCodes`    | array    | 否   | 已审核的过敏原分类标签 |
+| `allergenCodes`    | array    | 否   | 内容侧过敏原分类标签，用于展示与内容检索，**不作为** S1 安全判定依据；权威安全关联由 `FoodSafetyProfile.allergenIds` 管理 |
 | `textureTags`      | array    | 否   | 质地标签               |
 | `status`           | string   | 是   | 内容生命周期状态，枚举见 §5.1.1 |
 | `sourceReferences` | array    | 否   | 来源依据               |
@@ -447,8 +447,8 @@ Recipe 食谱
 
 说明：
 
-1. `allergenCodes` 不能只根据食材名称自动推断。
-2. 标签应来自经过审核的食材资料。
+1. `allergenCodes` 不能只根据食材名称自动推断；标签应来自经过审核的食材资料，**仅**服务内容与检索，**不得**替代 `FoodSafetyProfile` 参与 S1。
+2. 缺少、为空或未命中 `allergenCodes` **不得**作为候选食物安全的依据；S1 过敏判定 **不得**读取本字段。
 3. 食材分类、过敏原分类及质地标签应采用标准字典。
 4. 未知信息应允许为空，不得默认填充。
 5. 食材基础信息与具体食谱中的使用方式分开管理。
@@ -1052,9 +1052,9 @@ Recipe 食谱
 | `confirmationScope` | object | 条件 | 确认对象（如 `allergyItemId`、确认文案摘要 ID）；须可关联至本次解除 |
 | `reason`         | string   | 否   | 非敏感摘要；**不能**替代 `userConfirmationId` |
 | `outcome`        | string   | 是   | `success` / `failed` / `rejected` |
-| `operationId`    | string   | 条件 | 幂等操作 ID；`changeType=allergy_item_deactivated` **必填**（客户端 `requestId` 或服务端生成均可，须全局唯一于 `(profileId, allergyItemId, operationId)`） |
-| `revalidationTriggered` | boolean | 否 | 是否已触发未来未执行 `ScheduleTask` 重校验 |
-| `revalidationReference` | string | 否 | 重校验任务/批次引用 ID，便于与 04 §9.5 追溯 |
+| `operationId`    | string   | 条件 | 幂等操作 ID；`changeType=allergy_item_deactivated` **必填**。同一用户解除请求的**重试**须复用原 `operationId`；不同解除操作 **不得**复用已与 `outcome=success` 日志绑定的 `(profileId, allergyItemId, operationId)` 组合（见下文唯一性约束） |
+| `revalidationTriggered` | boolean | 否 | 是否在解除成功事务内已持久化日程重校验待处理任务（`true` 表示 Outbox/`BackgroundJob` 已与成功解除同事务创建，**非** Worker 执行完成标志） |
+| `revalidationReference` | string | 否 | 与本次解除关联的 `BackgroundJob._id`（02 §7.4.1）；便于与 04 §9.5 追溯；**不得**在日志写入后通过更新 append-only 记录补写 |
 | `createdAt`      | datetime | 是   | 记录写入时间    |
 
 **解除限制审计（F-04.2 / F-04.3-07 / F-04.3.1-02）**：
@@ -1063,11 +1063,56 @@ Recipe 食谱
 2. `actorId`、`userConfirmationId`、`userConfirmationAt`、`operationId` 必填；管理员代操作须 `source=admin_on_behalf_with_user_confirm` 且确认凭证可关联至该 `AllergyItem` 与本次解除。
 3. **不得**因 `reviewStatus` 变为 `rejected` 而省略用户确认或省略本条日志。
 4. 审计缺失、事务未提交、或无法关联具体 `AllergyItem` → **不得**视为解除成功；**禁止**在仅写入 `outcome=success` 日志而 `status` 未更新时对外宣称解除成功。
-5. 解除成功后须 `revalidationTriggered=true`（或写入 `revalidationReference`）；仅影响**未来未执行**任务（§7.0.1、05 §5.3.1）；**不得**追溯修改已执行 `ScheduleTask`。
-6. **幂等**：相同 `operationId` 且已存在 `outcome=success` 的 `allergy_item_deactivated` → 返回成功结果，**不得**重复写 `inactive` 或重复追加矛盾成功日志。
-7. **失败**：校验失败或 `status` 更新失败时，可追加 `outcome=failed`/`rejected` 日志（**不得**在同一事务中与 `inactive` 及 `success` 并存）；`AllergyItem.status` 保持 `active`。
+5. 解除成功时 **必须** 在同一数据库事务内：创建 `outcome=success` 日志、创建 `BackgroundJob`（§7.4.1），并写入 `revalidationTriggered=true` 与 `revalidationReference`（指向该 Job `_id`）。仅影响**未来未执行**任务（§7.0.1、05 §5.3.1）；**不得**追溯修改已执行 `ScheduleTask`。**禁止**在事务提交后通过更新 `AllergyChangeLog` 补写重校验关联字段。
+6. **`operationId` 唯一性（F-04.3.2）**：幂等键为 `(profileId, allergyItemId, operationId)`。对 `changeType=allergy_item_deactivated` 且 `outcome=success` 的记录，该三元组 **必须** 由集合 `allergy_change_logs` 上的**唯一索引**（或数据库等效强一致唯一约束）保障；**不得**仅依赖事务外查询。适用范围：同一 `profileId` 下针对同一 `allergyItemId` 的每次**成功**解除审计至多一条 success 日志。
+7. **条件更新与并发（F-04.3.2）**：`AllergyItem.status` 的解除 **必须** 采用条件更新（或等效 Compare-And-Set）：过滤条件 **必须** 包含 `status=active`（及 `_id`、`profileId` 等业务主键）。**不得**仅凭事务外读到 `active` 即视为可写。须检查数据库返回的**实际更新影响记录数**：
+   - 影响记录数 `= 1`：允许在同一事务内追加 `outcome=success` 日志与重校验 `BackgroundJob`。
+   - 影响记录数 `= 0`：**不得**在同一事务内写入 `outcome=success` 日志；须按 §7.4.1 与 06 §8.4 判定为幂等重试、已解除、或并发冲突。
+   - 影响记录数 `> 1` 或平台报错：**必须**终止事务并记录错误（数据异常）。
+8. **幂等重试（F-04.3.2）** — 相同 `(profileId, allergyItemId, operationId)` 的请求须按下表处理（**不得**仅因查到相同 `operationId` 即断言成功，须校验 `AllergyItem` 最终状态与 success 日志一致）：
+
+| 情况 | 处理要求 |
+| --- | --- |
+| 首次执行成功 | 返回成功结果（含审计与 Job 引用） |
+| 重复请求，原操作已成功 | 返回原操作结果；**不得**重复改 `inactive`、**不得**重复追加 success 日志或重复 Outbox Job |
+| 相同 `operationId` 正在执行（无 success 日志、状态可能仍为 `active`） | 返回可识别的处理中状态，或阻塞至首事务提交后再按上行判定；**不得**并发写入第二条 success 日志（唯一索引兜底） |
+| 相同 `operationId` 原操作已失败（仅有 `failed`/`rejected` 日志或无 success） | 允许在确认凭证仍有效时重试事务；**不得**伪造已成功 |
+| 不同 `operationId` 并发解除同一 `AllergyItem` | **仅一个**请求的条件更新影响记录数可为 `1` 并完成 success 日志；其余请求影响记录数为 `0`，**不得**写入 success 审计 |
+
+9. **失败**：校验失败或事务内任一步骤失败时，可 **独立** 追加 `outcome=failed`/`rejected` 日志（**不得**与 `inactive` 及 `success` 同事务）；`AllergyItem.status` 保持 `active`（或保持解除前状态）。
 
 **历史数据兼容**：F-04.3 之前已存在的日志可缺少 `actorId` / `userConfirmationId`；新解除操作从实施日起须满足上表必填条件。
+
+### 7.4.1 BackgroundJob 后台任务（含过敏解除日程重校验 Outbox）
+
+持久化集合 `background_jobs`（06 §10.1、§14.3）；与 append-only `AllergyChangeLog` 分工：**日志**记录不可变业务审计事实；**Job** 表达异步重校验执行状态，**不得**通过修改历史 `AllergyChangeLog` 更新 Worker 进度。
+
+**过敏解除触发的日程重校验**（`eventType` / `jobType` = `allergy_item_deactivated_schedule_revalidation`）建议字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `_id` | string | 是 | Job ID；写入 `AllergyChangeLog.revalidationReference` |
+| `jobType` | string | 是 | 固定 `allergy_item_deactivated_schedule_revalidation`（与 `eventType` 同义时可只存其一） |
+| `profileId` | string | 是 | 业务档案 |
+| `allergyItemId` | string | 是 | 本次解除的禁忌项 |
+| `operationId` | string | 是 | 与成功解除日志相同的幂等操作 ID |
+| `idempotencyKey` | string | 是 | 建议 `profileId + allergyItemId + operationId`；**须**唯一索引（见 §12） |
+| `status` | string | 是 | `pending` / `processing` / `completed` / `failed` |
+| `retryCount` | number | 是 | 已执行尝试次数（含失败）；初始 `0` |
+| `nextRetryAt` | datetime | 否 | 下次可领取时间；`failed` 终态后可为空 |
+| `lastError` | string | 否 | 最近一次失败摘要（非敏感） |
+| `createdAt` | datetime | 是 | 创建时间（与成功解除同事务） |
+| `updatedAt` | datetime | 是 | 更新时间 |
+| `completedAt` | datetime | 否 | 重校验流程成功结束时间 |
+
+**状态转换（本 Job 类型）**：
+
+- `pending` → `processing`：Worker 条件领取成功。
+- `processing` → `completed`：未来未执行任务重校验完成且无未处理致命错误。
+- `processing` → `pending`（或带 `nextRetryAt` 的待重试）：可恢复失败且未达最大重试次数。
+- `*` → `failed`：超过最大重试次数或不可恢复错误；**须**保留记录供人工排查与重新触发（06 §14.4）。
+
+**与解除事务的关系（Transactional Outbox）**：成功解除时 **必须** 在**同一**数据库事务内创建 `status=pending` 的上述 Job；若 Job 创建失败，**不得**单独提交 `inactive` 与 success 日志。
 
 ---
 
@@ -1298,6 +1343,7 @@ Recipe 食谱
 | `recipe_safety_profiles` | RecipeSafetyProfile | 食谱安全属性 |
 | `food_observations`   | FoodObservation  | 新食物观察       |
 | `allergy_change_logs` | AllergyChangeLog | 过敏信息变更历史 |
+| `background_jobs`     | BackgroundJob    | 后台异步任务（含过敏解除日程重校验 Outbox，§7.4.1） |
 | `safety_rules`        | SafetyRule       | 安全规则         |
 | `safety_rule_versions`| RuleVersion      | 安全规则版本（06 命名） |
 | `rule_versions`       | RuleVersion      | 规则版本（与 safety_rule_versions 二选一落地） |
@@ -1349,6 +1395,9 @@ Recipe 食谱
 | food_observations  | 查询观察记录         | `profileId + attemptedAt`       |
 | allergy_change_logs | 查询档案变更审计   | `profileId + createdAt`         |
 | allergy_change_logs | 按禁忌项追溯         | `allergyItemId + createdAt`     |
+| allergy_change_logs | 解除幂等（success） | **唯一索引** `profileId + allergyItemId + operationId`（仅 `changeType=allergy_item_deactivated` 且 `outcome=success`；平台不支持部分唯一索引时须在实现评审中采用等效约束，见 06 §10.4） |
+| background_jobs     | 按幂等键去重         | **唯一索引** `idempotencyKey`（至少覆盖 `allergy_item_deactivated_schedule_revalidation`） |
+| background_jobs     | Worker 领取待执行    | `status + nextRetryAt`（或 `jobType + status + nextRetryAt`） |
 | safety_rules       | 查询有效安全规则     | `reviewStatus + effectiveAt`    |
 | content_versions   | 查询内容版本         | `contentId + version`           |
 | business_events    | 按档案及时间统计     | `profileId + occurredAt`        |

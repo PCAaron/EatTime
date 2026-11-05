@@ -672,21 +672,57 @@ SafetyCheckResult
 
 - `AllergyChangeLog` 写入集合 `allergy_change_logs`（02 §7.4）；分类：**用户安全数据审计**，与通用 `audit_logs` 并存、不重复建第二套禁忌审计集合。
 - 仅 **`safety` / `profile` 云函数**（或等价应用服务）在业务校验通过后执行；小程序客户端 **只读** 或经云函数间接查询，**不得**直写。
-- **`allergy_item_deactivated` 原子一致性（首选：单库多文档事务）**：
-  1. **预检（事务外可读）**：校验 `actorId`、`userConfirmationId`、`userConfirmationAt`、`operationId`、`confirmationScope` 与目标 `AllergyItem`；校验 `AllergyItem.status=active`；校验用户确认凭证有效且未过期；**幂等**：若已存在同 `(profileId, allergyItemId, operationId)` 且 `outcome=success` 的日志 → 直接返回成功（不重复更新）。
+- **`allergy_item_deactivated` 原子一致性（首选：单库多文档事务 + Transactional Outbox，F-04.3.2）**：
+  1. **预检（事务外，非并发保证）**：校验 `actorId`、`userConfirmationId`、`userConfirmationAt`、`operationId`、`confirmationScope` 与目标 `AllergyItem`；校验用户确认凭证有效且未过期。**幂等快路径（须校验终态）**：若已存在同 `(profileId, allergyItemId, operationId)` 的 `outcome=success` 日志 **且** 目标 `AllergyItem.status=inactive` → 返回原成功结果（不重复更新、不重复 Outbox）。若仅有 success 日志但 `status` 仍为 `active` → **数据异常**，不得对外返回成功，须告警并按运维流程修复。
   2. **事务内（必须全部成功或全部回滚）**：
-     - 条件更新 `allergy_items`：`status` → `inactive`（建议 `updatedAt`/版本号乐观锁，防止并发重复解除）；
+     - **条件更新** `allergy_items`：过滤 `_id` + `profileId` + **`status=active`**，更新为 `inactive`（可配合 `updatedAt` 乐观字段，但 **必须以影响记录数为准**，见 §8.4.1）；
+     - 影响记录数 **必须为 1** 方可继续；为 **0** 时 **不得** 在本事务写入 `outcome=success` 或创建 Outbox Job（转入 §8.4.1 分支）；**> 1** 或平台异常 → 回滚并记录错误；
      - **同一事务内**追加 `AllergyChangeLog`：`changeType=allergy_item_deactivated`，`outcome=success`，`previousStatus=active`，`nextStatus=inactive`，`changedItems` 含变更快照；
-     - **禁止**在 `status` 更新失败时写入 `outcome=success`。
-  3. **事务提交后**：触发 §8.4 重新校验流程；更新或补写 `revalidationTriggered` / `revalidationReference`（可与重校验任务创建同一后续步骤；若异步，须在任务创建失败时有可恢复补偿，不得对外宣称解除未完成）。
-  4. **失败路径**：预检或事务失败 → **不得**将 `status` 置为 `inactive`；可追加 `outcome=failed`/`rejected` 日志（独立写入，不与成功解除同事务）；客户端可凭相同 `operationId` 安全重试预检/事务（幂等）。
-- **等效机制**：若运行环境无法使用可靠多文档事务，须采用两阶段状态（如 `deactivation_pending` → `inactive`）+ 可恢复 Saga，且 **`outcome=success` 仅出现在 `inactive` 已持久化之后**；具体状态机须在实现设计评审中映射至 02 `AllergyItem.status` 枚举扩展或内部操作表，**不得**仅声明「最终一致」而无补偿步骤。
-- 成功解除后触发 §8.4 重新校验流程，并在日志中记录 `revalidationTriggered` / `revalidationReference`。
+     - **同一事务内**创建 `BackgroundJob`（02 §7.4.1）：`jobType=allergy_item_deactivated_schedule_revalidation`，`status=pending`，`idempotencyKey=profileId+allergyItemId+operationId`，并在 success 日志写入 `revalidationTriggered=true`、`revalidationReference=<job._id>`；
+     - **禁止**在 `status` 条件更新未成功（影响记录数 ≠ 1）时写入 `outcome=success` 或创建 Outbox。
+  3. **事务提交后**：由 `scheduler` / `safety` Worker 异步领取 §14.4 定义的 Job 执行日程重校验；**不得**依赖「提交后再创建 Job」作为唯一触发（Job 已在事务内持久化）。
+  4. **失败路径**：预检失败或事务失败 → **不得**将 `status` 置为 `inactive`；可 **独立** 追加 `outcome=failed`/`rejected` 日志（不与成功解除同事务）；客户端可凭相同 `operationId` 在凭证仍有效时重试事务（§8.4.1）。
+- **等效机制**：若运行环境无法使用可靠多文档事务，须采用两阶段状态（如 `deactivation_pending` → `inactive`）+ 可恢复 Saga，且 **`outcome=success` 与 Outbox Job 仅出现在 `inactive` 已持久化之后**；具体状态机须在实现设计评审中映射至 02 `AllergyItem.status` 枚举扩展或内部操作表，**不得**仅声明「最终一致」而无补偿步骤与 Outbox 等价物。
 
-安全信息发生变化时：
+#### 8.4.1 解除幂等、并发与影响记录数（F-04.3.2）
+
+**数据库约束（须与 02 §12 一致）**：
+
+- `allergy_change_logs`：**唯一索引** `(profileId, allergyItemId, operationId)`，约束 `changeType=allergy_item_deactivated` 且 `outcome=success`（或实现层等效唯一性）。
+- `background_jobs`：**唯一索引** `idempotencyKey`（过敏解除重校验 Job）。
+
+**条件更新语义**：解除 API **必须**使用「仅当 `status=active` 时更新为 `inactive`」的原子操作；**禁止**将事务外的 `find` 结果作为唯一并发依据。
+
+**影响记录数 = 0 时的分支**（事务内更新失败后 **不得** 写 success 日志）：
+
+| 当前持久化状态 | 处理 |
+| --- | --- |
+| 已存在本 `operationId` 的 success 日志且 `status=inactive` | 幂等成功，返回原结果 |
+| `status=inactive` 但无本 `operationId` 的 success 日志 | 视为已由其他 `operationId` 解除或数据不一致；返回「已解除」或冲突，**不得**补写 success |
+| `status=active`，无 success 日志 | 并发失败或重复 `operationId` 首请求仍在进行；返回处理中或可重试，**不得**写 success |
+| 其他 | 终止并告警 |
+
+**相同 `operationId` 重试**：见 02 §7.4 表；失败后可重试事务，但 success 日志与 Outbox **至多一条**（唯一索引强制）。
+
+**不同 `operationId` 并发**：仅首个影响记录数 = 1 的请求完成 success + Outbox；其余影响记录数 = 0，**不得**产生第二条 success 审计。
+
+**异常场景保证**（规格层）：
+
+| 异常场景 | 必须保证的结果 |
+| --- | --- |
+| AllergyItem 条件更新失败（影响 0，且无幂等 success） | 无 success 审计、无 Outbox Job |
+| AllergyChangeLog 写入失败 | 整事务回滚，`status` 仍为 `active` |
+| Outbox Job 创建失败 | 整事务回滚，不得单独留下 `inactive` + success |
+| 事务提交后 Worker 未运行 | Job 仍为 `pending`，可扫描恢复 |
+| Worker 执行中崩溃 | Job 可重新领取（见 §14.4），不丢失 |
+| 重复消费同一 Job | 不重复产生错误任务副作用（§14.4 幂等） |
+| 重校验持续失败 | 保留 `lastError`、`retryCount`，达上限进 `failed` |
+| 系统重启 | 扫描 `pending` / 超时 `processing` 恢复 |
+
+安全信息发生变化时（含 Worker 完成的过敏解除重校验）：
 
 1. 保存新版本（含 `AllergyChangeLog` 追加，适用时）。
-2. 创建重新校验任务。
+2. 消费已持久化的重校验 `BackgroundJob`（或同等 Outbox），**不得**假设仅内存/进程内触发。
 3. 查询未来未执行日程。
 4. 对相关食谱重新执行安全校验。
 5. 阻断不再满足条件的任务。
@@ -819,6 +855,7 @@ cloud database
 | `allergy_profiles` | — | **已废弃**；历史数据应迁移至 `user_safety_profiles` |
 | `food_observations` | `FoodObservation` | 新食物观察 |
 | `allergy_change_logs` | `AllergyChangeLog` | 过敏状态与禁忌变更审计（仅服务端追加） |
+| `background_jobs` | `BackgroundJob` | 后台任务（含过敏解除日程重校验 Outbox，02 §7.4.1） |
 | `food_allergens` | `FoodAllergen` | 过敏原字典 |
 | `food_safety_profiles` | `FoodSafetyProfile` | 食材侧安全属性 |
 | `recipe_safety_profiles` | `RecipeSafetyProfile` | 食谱侧安全属性 |
@@ -925,7 +962,10 @@ updatedAt
 - 根据 recipeId 和版本查询内容。
 - 根据规则状态及生效时间查询有效规则。
 - 根据任务状态和重试时间查询后台任务。
-- 根据 `profileId` + `allergyItemId` + `operationId` 查询 `allergy_change_logs`（解除幂等，F-04.3.1-02；02 §7.4）。
+- 根据 `profileId` + `allergyItemId` + `operationId` 查询 `allergy_change_logs`（解除幂等读路径，F-04.3.1-02 / F-04.3.2；02 §7.4）。
+- **`allergy_change_logs` 唯一索引**：`profileId + allergyItemId + operationId`（约束成功解除审计；02 §12）。
+- **`background_jobs` 唯一索引**：`idempotencyKey`（过敏解除重校验 Job 去重；02 §7.4.1）。
+- **`background_jobs` Worker 扫描**：`jobType + status + nextRetryAt`（或 `status + nextRetryAt`）。
 
 云数据库的索引限制、组合查询能力和实际执行计划必须在实施阶段验证。
 
@@ -1148,14 +1188,17 @@ Recipe
 
 ```text
 BackgroundJob
-  - jobId
+  - jobId / _id
   - jobType
-  - targetId
+  - profileId
+  - allergyItemId（过敏解除重校验等类型必填）
+  - operationId（与 AllergyChangeLog 关联）
+  - targetId（可选冗余，如 profileId）
   - idempotencyKey
   - status
-  - attempts
+  - retryCount / attempts
   - nextRetryAt
-  - lastErrorCode
+  - lastError / lastErrorCode
   - createdAt
   - updatedAt
   - completedAt
@@ -1165,11 +1208,34 @@ BackgroundJob
 
 - pending
 - processing
-- succeeded
+- completed（06 其它 Job 类型沿用时可用 `succeeded` 作同义，但过敏解除重校验 Job **须**使用 `completed` 与 02 §7.4.1 一致）
 - failed
-- retry_wait
+- retry_wait（可选；与 `pending` + `nextRetryAt` 组合表达退避时二选一落地）
 
-具体字段需与实际任务执行方案保持一致。
+具体字段需与实际任务执行方案保持一致；**过敏解除日程重校验**的字段语义以 02 §7.4.1 为准。
+
+### 14.4 过敏解除日程重校验 Worker（F-04.3.2）
+
+**领取**：Worker（`scheduler` 或 `safety`）须通过 **条件更新** 将 Job 从 `pending`（且 `nextRetryAt` 为空或 ≤ 当前时间）置为 `processing`，并记录 `updatedAt`；**仅当**影响记录数 = 1 时视为领取成功，避免多 Worker 重复执行。
+
+**执行范围**：
+
+1. 仅重校验该 `profileId` 下 **未来尚未执行** 的 `ScheduleTask`（与 04 §9.5、05 §5.3.1 一致）。
+2. **不得**修改已完成历史 `ScheduleTask`。
+3. **不得**绕过 S1 过敏过滤（05 §5.3.2）。
+4. 执行逻辑须 **幂等**：同一 Job 重复消费不得重复错误阻断或重复写入矛盾状态。
+
+**成功**：将 Job 置 `completed`，写入 `completedAt`；可 emit `safety_revalidation_completed`（05 事件表）。
+
+**失败与重试**：
+
+- 可恢复错误：`retryCount` 递增，计算 `nextRetryAt`（指数退避，参数在实施配置中定义，**须**文档化默认值建议：如最大 **5** 次、`baseDelay` 1 分钟），状态回 `pending` 或 `retry_wait`。
+- 超过最大重试次数或不可恢复错误：`status=failed`，保留 `lastError` 与 `retryCount`，**禁止**静默删除。
+- **人工恢复**：管理端或运维 API 须支持对 `failed` Job 重新置 `pending`（新 `operationId` **不**要求；仍关联原解除 `operationId`）或创建补偿 Job；须审计。
+
+**系统重启**：启动时扫描 `pending` 及超时未更新的 `processing`（超时阈值须配置，如 15 分钟），将僵死 `processing` 重置为可领取状态并递增 `retryCount` 或按策略标记失败。
+
+**与 AllergyChangeLog 的边界**：Worker **不得**更新 append-only `AllergyChangeLog` 以反映进度；进度仅存在于 `background_jobs`。
 
 ## 15. 轻量内容管理后台
 

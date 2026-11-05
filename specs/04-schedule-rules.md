@@ -485,7 +485,7 @@ L0 是不可被覆盖的硬约束。
 1. 读取当前档案有效禁忌：`AllergyItem.profileId` = 当前档案且 `status=active`（**不**依赖 `allergyStatus=confirmed_allergy`）。
 2. 对候选食谱/食材按 S1 命中规则检查（含 `foodItemId`、`allergenId`、`05` §5.3.2 `foodName` 文本匹配）。
 3. 检查食谱主料、辅料及已结构化展开的成分（`RecipeIngredient` 等，见 03 §6.1）。
-4. 检查食材的已审核过敏原关联（`FoodAllergen` / 已发布 `FoodItem.allergenCodes`）。
+4. 检查候选食材（及展开成分）的**已审核**过敏原关联：`FoodSafetyProfile.allergenIds` 与 `FoodAllergen` 字典（05 §5.3.2.1 **A/B**、§5.3.2.3 **B**）；**不使用** `FoodItem.allergenCodes` 作为 S1 判定依据（05 §5.3.2.1 **F**、03 §4.4）。
 5. 检查已知的交叉接触风险信息（可信状态为 `verified` 等，见 05 §6.4）。
 6. 命中禁忌或文本匹配结果为 `matched` 时，直接排除该食谱。
 7. 文本匹配结果为 `unresolved` 时，**不得**默认安全；须排除自动生成或进入待确认/审核流程（见 05 §5.3.2）。

@@ -276,7 +276,7 @@ FoodItem 表示一个标准食材。
 
 ### 4.4 过敏原字典（FoodAllergen）
 
-持久化实体 `FoodAllergen`，集合 `food_allergens`（02 §7.0、05 §5.4）。`FoodItem.allergenCodes` 为内容侧分类标签，**不能**替代已审核的 `FoodSafetyProfile.allergenIds` 用于 S1 门禁（05 §5.3.2.1）。
+持久化实体 `FoodAllergen`，集合 `food_allergens`（02 §7.0、05 §5.4）。`FoodItem.allergenCodes` 为内容侧分类标签，**不参与** S1 匹配（05 §5.3.2.1 **F**）；过敏原硬过滤以已审核 `FoodSafetyProfile.allergenIds` 为准。
 
 **字典项字段**（与 02/05 一致）：
 
@@ -295,13 +295,13 @@ FoodItem 表示一个标准食材。
 | `reviewedAt`       | datetime | 否   | 最近一次发布审核时间 |
 | `version`          | string   | 是   | 字典版本号 |
 
-**名称与映射（F-04.3-03）**：
+**名称与映射（F-04.3-03 / F-04.3.1-01）**：
 
 1. 用户自由输入的名称 **不得** 自动写入 `aliases`。
-2. 无法映射到唯一已发布 `FoodItem` 或 `FoodAllergen` 的用户输入，在 S1 中按 05 §5.3.2.5 返回 `unresolved`。
+2. 用户声明**无法唯一映射**到已发布 `FoodItem` 或 `FoodAllergen` 时，S1 **必须** 按 05 §5.3.2.5 **规则 A** 返回 `unresolved`；**禁止**在 C3 零命中或声明侧未通过 §5.3.2.1 **E** 时返回 `not_matched`。
 3. 复合食品须维护可展开的结构化成分（Recipe / `RecipeIngredient`）；成分不完整时 **不得** 作为完整安全数据参与 `not_matched`。
 
-**食材 `allergenCodes`（`FoodItem`）**：须有依据并经审核；不得仅关键词认定；未确认不得默认无过敏原；与 `FoodSafetyProfile.allergenIds` 的 S1 职责区分见 §4.5 末及 05 §5.3.2.1。
+**食材 `allergenCodes`（`FoodItem`）（F-04.3.1-03）**：须有依据并经审核；不得仅关键词认定；未确认不得默认无过敏原。**S1 硬过滤不以 `allergenCodes` 作为匹配输入**；过敏原关联以已审核 `FoodSafetyProfile.allergenIds` 为准（05 §5.3.2.1 **F**、§5.3.2.3 **B**）。该字段用于展示与内容检索（§4.5）。
 
 ### 4.5 食材状态
 
@@ -316,7 +316,7 @@ FoodItem 表示一个标准食材。
 
 未发布或已撤回的食材，不得作为新发布食谱的有效食材引用。
 
-**`allergenCodes`（内容标签）**：可引用 §4.4 字典编码，用于展示与内容检索；S1 硬过滤以 `FoodSafetyProfile` 已审核关联为准（05 §5.3.2.1）。
+**`allergenCodes`（内容标签）**：可引用 §4.4 字典编码，用于展示与内容检索；**不参与** S1 匹配判定（05 §5.3.2.1 **F**）。S1 硬过滤以 `FoodSafetyProfile` 已审核 `allergenIds` 为准。
 
 ---
 
@@ -424,7 +424,7 @@ Recipe 表示一条经过结构化维护的标准食谱。
 | 饮食属性   | `dietTags`             | 描述食谱属性       |
 | 质地标签   | `textureTags`          | 描述食物质地       |
 | 难度标签   | `difficulty`           | 估计制作难度       |
-| 过敏原标签 | `allergenCodes`        | 支持安全过滤       |
+| 过敏原标签 | `allergenCodes`        | 内容展示与检索；S1 以 `FoodSafetyProfile` / 成分展开为准（§4.4） |
 | 阶段标签   | `applicableStageCodes` | 支持阶段匹配       |
 
 标签必须采用受控字典。

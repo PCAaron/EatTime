@@ -381,6 +381,14 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 2. 缺少必要安全数据、数据未审核、关联不完整、或存在名称/ID 冲突时，**不得**默认 `not_matched`。
 3. `unresolved` **不得**被视为安全通过。
 
+**三态判定口径（F-04.3.1-01，跨 03 §4.4、04 §9.3 一致）**：
+
+| 规则 | 内容 |
+| --- | --- |
+| **规则 A** | 用户禁忌声明**本身**无法唯一、可靠映射到标准 `FoodItem` / `FoodAllergen`（或等效已审核实体）时，对本候选 **必须** 返回 `unresolved`。包括但不限于：零命中已发布标准名/别名、仅命中未审核别名、多实体歧义、标准化冲突、复合声明无法完整解析、信息不足以建立唯一映射。**不得**因候选侧安全数据完整，将上述情况判为 `not_matched`。 |
+| **规则 B** | `not_matched` **仅当**用户声明侧与候选侧均已完成可靠映射，且 §5.3.2.1 门禁对本候选及已启用路径**全部通过**，且 §5.3.2.3 适用步骤均未 `matched`、亦不存在应返回 `unresolved` 的条件。 |
+| **规则 C** | 任何无法证明「双方映射完整且确定无命中」的情形 **一律** `unresolved`。`unresolved` 既不等于确认含过敏原，也不等于确认安全；S1 **不得**据此放行或自动生成。 |
+
 #### 5.3.2.1 安全数据完整性与 `not_matched` 门禁（F-04.3-01）
 
 「必要安全数据完整」指：针对**当前候选**及本禁忌**已启用的匹配路径**，下列条件均满足；任一不满足 → 对本候选**不得**返回 `not_matched`（返回 `unresolved` 或已在更早步骤返回 `matched`）。
@@ -420,6 +428,22 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 - `AllergyItem.status` 仅决定**是否参与 S1**；`reviewStatus` **不**跳过 active 禁忌的匹配。
 - 用户声明的 `foodName` 始终保留原值；**不**因 `reviewStatus=pending_review` 降低匹配强度。
+
+**E. 用户禁忌声明侧映射（F-04.3.1-01，`not_matched` 前置条件）**
+
+在返回 `not_matched` 前，须确认本条 `AllergyItem` 在**本候选所依赖的匹配路径上**已完成可靠映射：
+
+| 禁忌字段 | 声明侧「已映射」条件 | 未满足时 |
+| --- | --- | --- |
+| `foodItemId` | ID 指向已发布 `FoodItem` | **unresolved** |
+| `allergenId` | ID 指向 `FoodAllergen.status=active` 且实体级内容已发布（**B**） | **unresolved** |
+| 仅 `foodName`（无可靠 ID） | 派生键**唯一**命中已发布 `FoodItem.name` 或实体级已审核 `aliases[]`，或**唯一**命中已发布 `FoodAllergen` 标准名/已审核别名（与 §5.3.2.3 C1/C2 相同准入） | 零命中、多命中、仅未审核别名、或无法解析 → **unresolved**（**规则 A**）；**禁止**在仅 `foodName` 且 C3 零命中时返回 `not_matched` |
+
+**F. `FoodItem.allergenCodes` 与 S1（F-04.3.1-03）**
+
+- `FoodItem.allergenCodes` 为**内容标签**，**不是** S1 权威安全数据源；**不得**参与 §5.3.2.3 场景 B 的 `matched` / `not_matched` 判定，**不得**因该字段缺失、为空或未命中而认定候选不含过敏原或返回 `not_matched`。
+- S1 过敏原关联的**唯一**判定依据为已审核发布的 `FoodSafetyProfile.allergenIds` 及 **B** 节 `FoodAllergen` 字典（与 03 §4.4、§4.5 一致）。
+- 内容标签与 `FoodSafetyProfile` 不一致时，以 **A/B** 权威数据为准；标签 alone **不得**推翻或替代 profile 结论。
 
 #### 5.3.2.2 名称标准化与碰撞（F-04.3-04）
 
@@ -484,16 +508,15 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 | --- | --- | --- | --- |
 | C1 | 派生键与**唯一**已发布 `FoodItem.name` 或实体级已审核 `aliases[]` 相等 | **matched** | 否 |
 | C2 | 派生键与**唯一**已发布 `FoodAllergen` 标准名/已审核别名相等且与禁忌声明语义一致（食物级禁忌） | **matched** | 否 |
-| C3 | 命中 0 个标准名/别名 | 见 §5.3.2.5 | — |
+| C3 | 命中 0 个标准名/别名 | **unresolved**（**规则 A**；用户声明无法唯一映射） | 否 |
 | C4 | 命中 \>1 个标准实体 | **unresolved** | 否 |
 | C5 | 复合候选缺成分或 `RecipeSafetyProfile` 不完整 | **unresolved** | 否 |
 
-**最终 `not_matched`（仅当同时满足）**：
+**最终 `not_matched`（仅当同时满足，规则 B）**：
 
 1. 上述适用步骤均未 `matched`；
-2. §5.3.2.1 对本候选及已走路径**全部通过**；
-3. 不存在 C4/C5 及 A4/A5/B2/B3 类 **unresolved** 条件；
-4. 对仅 `foodName` 禁忌且 C3 适用：已确认用户声明文本**无法**映射到任何标准实体，且候选 side 数据完整（见 §5.3.2.5）。
+2. §5.3.2.1 **含 E** 对本禁忌声明与候选及已走路径**全部通过**；
+3. 不存在 C3/C4/C5 及 A4/A5/B2/B3 类 **unresolved** 条件。
 
 **明确规则**：
 
@@ -513,15 +536,16 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 实体级 `reviewedBy`、`reviewedAt`、`version` 字段归属与生命周期见 **03 §4.2.1、§4.4**；05 仅约束其参与匹配的准入。
 
-#### 5.3.2.5 未知 `foodName` 与无法映射输入（F-04.3-03）
+#### 5.3.2.5 未知 `foodName` 与无法映射输入（F-04.3-03 / F-04.3.1-01）
 
-1. 无法匹配任何已发布标准名或实体级已审核别名 → **不得** 判定为安全；对本候选返回 **unresolved**（非「倾向」）。
+1. 无法匹配任何已发布标准名或实体级已审核别名 → **不得** 判定为安全；对本候选返回 **unresolved**（**规则 A**）。
 2. 无法确认用户输入对应**哪一个**标准 `FoodItem` / 声明对象 → **unresolved**。
 3. **禁止** 模糊匹配、拼音、编辑距离、未经审核别名 → `not_matched`。
 4. 用户输入可对应多个标准实体 → **unresolved**；产品应引导用户选择标准食材或补充信息（绑定 `foodItemId`）。
 5. 复合食品名称无法完整解析成分 → **unresolved**。
 6. 禁忌已绑定可靠 `foodItemId` / `allergenId` 时，**仍优先** A/B 路径；未知 `foodName` 不削弱 ID 级 `matched`。
-7. 仅当禁忌**仅有** `foodName`、且 C3「零命中」、且候选侧 §5.3.2.1 完整时，方可对**该文本声明**在完整候选上得出 `not_matched`（表示「该候选与声明文本无等价已审核映射」）；仍 **unresolved** 若用户声明本身尚未与标准库建立唯一映射且产品要求人工确认。
+7. 禁忌**仅有** `foodName` 且 C3 零命中 → **unresolved**；**禁止**以「候选侧数据完整」为由返回 `not_matched`。
+8. 仅当禁忌 `foodName` 已通过 C1/C2 **唯一**映射到标准实体、且候选为**不同**已映射实体、§5.3.2.1 与 §5.3.2.3 全部适用步骤完成且无命中时，方可 `not_matched`（见 §5.3.2.6 场景 6 前提）。
 
 #### 5.3.2.6 测试场景（规则层，确定性）
 
@@ -532,7 +556,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 | 3 | 与草稿/未发布别名相等 | `unresolved` |
 | 4 | 全角/半角、空格、约定标点差异 | 标准化后相等 → `matched`（唯一实体） |
 | 5 | 英文大小写差异 | `matched`（唯一实体） |
-| 6 | 相似但不同名称，无审核别名，候选 **A** 完整 | `not_matched` |
+| 6 | 用户 `foodName` **唯一**映射标准实体 A；候选为不同标准实体 B，**A/B/C** 完成且无命中，**E** 通过 | `not_matched` |
 | 6b | 同上但缺 `FoodSafetyProfile` 或未审核 | `unresolved` |
 | 7 | 复合食谱成分含禁忌 `foodItemId` | `matched` |
 | 8 | 复合食谱 `ingredientCompleteness=complete` 且各成分 **A** 完整且无命中 | `not_matched` |
@@ -553,8 +577,9 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 2. 专业人员、后台审核任务或自动化 **不得**仅凭将 `reviewStatus` 设为 `rejected` 把 `status` 改为 `inactive`。
 3. 在 `status=active` 期间（含 `reviewStatus=rejected`），S1 **继续**硬过滤。
 4. **仅**用户在产品内完成明确解除确认（及 SAF-10 规定的安全流程）后，方可将 `status` 更新为 `inactive`。
-5. 解除 **必须** 写入完整 `AllergyChangeLog`（02 §7.4）；**缺少必填审计字段视为解除未成功**，不得将 `AllergyItem.status` 持久化为 `inactive`。
+5. 解除 **必须** 与 `outcome=success` 的 `AllergyChangeLog` **原子提交**（同一数据库事务或 06 §8.4 等效机制）；**缺少必填审计字段或事务未提交成功，均视为解除未成功**，不得将 `AllergyItem.status` 持久化为 `inactive`。
 6. 解除后须重新校验未来未执行 `ScheduleTask`（§5.3.1、04 §9.5）；已执行历史不得追溯修改；审计须能关联本次解除触发的重校验（`revalidationTriggered` / `revalidationReference`）。
+7. `outcome=success` **仅当** `AllergyItem.status` 已成功持久化为 `inactive` 时写入；须携带幂等 `operationId`（02 §7.4）；重复请求不得重复解除或产生矛盾成功记录（见 06 §8.4）。
 
 **执行者与用户确认（不得用 `source` 替代）**：
 

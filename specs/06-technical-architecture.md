@@ -668,11 +668,19 @@ SafetyCheckResult
 
 ### 8.4 安全档案更新
 
-**过敏禁忌解除与审计（F-04.3-06 / F-04.3-07）**：
+**过敏禁忌解除与审计（F-04.3-06 / F-04.3-07 / F-04.3.1-02）**：
 
 - `AllergyChangeLog` 写入集合 `allergy_change_logs`（02 §7.4）；分类：**用户安全数据审计**，与通用 `audit_logs` 并存、不重复建第二套禁忌审计集合。
-- 仅 **`safety` / `profile` 云函数**（或等价应用服务）在业务校验通过后 **追加** 写入；小程序客户端 **只读** 或经云函数间接查询，**不得**直写。
-- `allergy_item_deactivated` 须校验 `actorId`、`userConfirmationId`、`outcome=success` 后方能更新 `allergy_items.status`；失败须 `outcome=failed`/`rejected` 且不改 `status`。
+- 仅 **`safety` / `profile` 云函数**（或等价应用服务）在业务校验通过后执行；小程序客户端 **只读** 或经云函数间接查询，**不得**直写。
+- **`allergy_item_deactivated` 原子一致性（首选：单库多文档事务）**：
+  1. **预检（事务外可读）**：校验 `actorId`、`userConfirmationId`、`userConfirmationAt`、`operationId`、`confirmationScope` 与目标 `AllergyItem`；校验 `AllergyItem.status=active`；校验用户确认凭证有效且未过期；**幂等**：若已存在同 `(profileId, allergyItemId, operationId)` 且 `outcome=success` 的日志 → 直接返回成功（不重复更新）。
+  2. **事务内（必须全部成功或全部回滚）**：
+     - 条件更新 `allergy_items`：`status` → `inactive`（建议 `updatedAt`/版本号乐观锁，防止并发重复解除）；
+     - **同一事务内**追加 `AllergyChangeLog`：`changeType=allergy_item_deactivated`，`outcome=success`，`previousStatus=active`，`nextStatus=inactive`，`changedItems` 含变更快照；
+     - **禁止**在 `status` 更新失败时写入 `outcome=success`。
+  3. **事务提交后**：触发 §8.4 重新校验流程；更新或补写 `revalidationTriggered` / `revalidationReference`（可与重校验任务创建同一后续步骤；若异步，须在任务创建失败时有可恢复补偿，不得对外宣称解除未完成）。
+  4. **失败路径**：预检或事务失败 → **不得**将 `status` 置为 `inactive`；可追加 `outcome=failed`/`rejected` 日志（独立写入，不与成功解除同事务）；客户端可凭相同 `operationId` 安全重试预检/事务（幂等）。
+- **等效机制**：若运行环境无法使用可靠多文档事务，须采用两阶段状态（如 `deactivation_pending` → `inactive`）+ 可恢复 Saga，且 **`outcome=success` 仅出现在 `inactive` 已持久化之后**；具体状态机须在实现设计评审中映射至 02 `AllergyItem.status` 枚举扩展或内部操作表，**不得**仅声明「最终一致」而无补偿步骤。
 - 成功解除后触发 §8.4 重新校验流程，并在日志中记录 `revalidationTriggered` / `revalidationReference`。
 
 安全信息发生变化时：
@@ -917,6 +925,7 @@ updatedAt
 - 根据 recipeId 和版本查询内容。
 - 根据规则状态及生效时间查询有效规则。
 - 根据任务状态和重试时间查询后台任务。
+- 根据 `profileId` + `allergyItemId` + `operationId` 查询 `allergy_change_logs`（解除幂等，F-04.3.1-02；02 §7.4）。
 
 云数据库的索引限制、组合查询能力和实际执行计划必须在实施阶段验证。
 

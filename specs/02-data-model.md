@@ -841,7 +841,7 @@ Recipe 食谱
 1. 候选 `FoodItem` 须 `status=published`，且存在 `FoodSafetyProfile`（`foodItemId`）且 `reviewStatus` 为 `approved`/`published`，方可在过敏原关联路径上视为数据完整。
 2. `FoodSafetyProfile.allergenIds` 为空数组且已满足上条 → 表示**已审核确认**当前无已知关联过敏原；**无** `FoodSafetyProfile` 记录 ≠ 无过敏原。
 3. 食谱/复合候选须 `RecipeSafetyProfile.ingredientCompleteness=complete` 且已审核发布，方可对展开成分做 `not_matched` 结论。
-4. `FoodItem.allergenCodes` 为内容标签，**不能**单独替代 `FoodSafetyProfile` 用于 S1 `not_matched` 门禁。
+4. `FoodItem.allergenCodes` 为内容标签，**不参与** S1 匹配判定；**不能**单独替代 `FoodSafetyProfile` 用于 S1 `not_matched` 门禁（05 §5.3.2.1 **F**）。
 
 ### 7.0.3 DeclaredRestriction 孕期/档案级声明限制（SAF-08 已采纳）
 
@@ -1052,17 +1052,20 @@ Recipe 食谱
 | `confirmationScope` | object | 条件 | 确认对象（如 `allergyItemId`、确认文案摘要 ID）；须可关联至本次解除 |
 | `reason`         | string   | 否   | 非敏感摘要；**不能**替代 `userConfirmationId` |
 | `outcome`        | string   | 是   | `success` / `failed` / `rejected` |
+| `operationId`    | string   | 条件 | 幂等操作 ID；`changeType=allergy_item_deactivated` **必填**（客户端 `requestId` 或服务端生成均可，须全局唯一于 `(profileId, allergyItemId, operationId)`） |
 | `revalidationTriggered` | boolean | 否 | 是否已触发未来未执行 `ScheduleTask` 重校验 |
 | `revalidationReference` | string | 否 | 重校验任务/批次引用 ID，便于与 04 §9.5 追溯 |
 | `createdAt`      | datetime | 是   | 记录写入时间    |
 
-**解除限制审计（F-04.2 / F-04.3-07）**：
+**解除限制审计（F-04.2 / F-04.3-07 / F-04.3.1-02）**：
 
-1. 将 `AllergyItem.status` 从 `active` 变为 `inactive` 时 **必须** 写入一条 `outcome=success` 的 `AllergyChangeLog`，且 `changeType=allergy_item_deactivated`，`allergyItemId` 与 `changedItems` 一致。
-2. `actorId`、`userConfirmationId`、`userConfirmationAt` 必填；管理员代操作须 `source=admin_on_behalf_with_user_confirm` 且确认凭证可关联至该 `AllergyItem` 与本次解除。
+1. 将 `AllergyItem.status` 从 `active` 变为 `inactive` 时 **必须** 与一条 `outcome=success` 的 `AllergyChangeLog` **同一事务提交**（`changeType=allergy_item_deactivated`，`allergyItemId` 与 `changedItems` 一致）；见 06 §8.4。
+2. `actorId`、`userConfirmationId`、`userConfirmationAt`、`operationId` 必填；管理员代操作须 `source=admin_on_behalf_with_user_confirm` 且确认凭证可关联至该 `AllergyItem` 与本次解除。
 3. **不得**因 `reviewStatus` 变为 `rejected` 而省略用户确认或省略本条日志。
-4. 审计缺失或无法关联具体 `AllergyItem` → **不得**视为解除成功。
+4. 审计缺失、事务未提交、或无法关联具体 `AllergyItem` → **不得**视为解除成功；**禁止**在仅写入 `outcome=success` 日志而 `status` 未更新时对外宣称解除成功。
 5. 解除成功后须 `revalidationTriggered=true`（或写入 `revalidationReference`）；仅影响**未来未执行**任务（§7.0.1、05 §5.3.1）；**不得**追溯修改已执行 `ScheduleTask`。
+6. **幂等**：相同 `operationId` 且已存在 `outcome=success` 的 `allergy_item_deactivated` → 返回成功结果，**不得**重复写 `inactive` 或重复追加矛盾成功日志。
+7. **失败**：校验失败或 `status` 更新失败时，可追加 `outcome=failed`/`rejected` 日志（**不得**在同一事务中与 `inactive` 及 `success` 并存）；`AllergyItem.status` 保持 `active`。
 
 **历史数据兼容**：F-04.3 之前已存在的日志可缺少 `actorId` / `userConfirmationId`；新解除操作从实施日起须满足上表必填条件。
 

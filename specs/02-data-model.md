@@ -810,10 +810,18 @@ Recipe 食谱
 3. `skipped` 不阻塞建档与基础日程（见 05）。
 4. 若涉及专业记录，`informationSource` 应能表达来源类型；不应默认要求用户上传完整医疗资料。
 
+**与 `AllergyItem.status` 的职责分离（F-04.2，与 04 §9.2—9.3、05 §5.3.1 一致）**：
+
+1. `allergyStatus` 仅表达用户整体过敏信息的填写、认知或观察状态（如是否处于观察流程、是否暂时跳过设置），**不**决定某一条 `AllergyItem` 是否参与 S1 硬过滤。
+2. S1 有效禁忌集合**唯一**由 `AllergyItem.profileId` + `status=active` 定义；与 `allergyStatus` 取值无关。
+3. 将 `allergyStatus` 改为 `none_known`、`skipped`、`observing` 或 `confirmed_allergy` **不得**自动把已有 `AllergyItem` 置为 `inactive`。
+4. 用户 `skipped` 或 `none_known` **不得**作为忽略已存在 `status=active` 禁忌项的理由。
+5. 仅当用户对具体 `AllergyItem` 完成明确解除流程（`status` → `inactive`，见 §7.2、05 §5.3.3）后，该条限制才退出 S1。
+
 约束：
 
 1. 一个 `Profile` 对应一条 `UserSafetyProfile`。
-2. 修改 `allergyStatus` 或有效 `AllergyItem` 后必须触发未来未执行 `ScheduleTask` 重新校验（见 05）。
+2. 修改 `allergyStatus` 或有效 `AllergyItem` 后必须触发未来未执行 `ScheduleTask` 重新校验（见 05）；**已执行**历史任务不得追溯改写。
 3. `skipped` 不阻塞建档与基础日程；不得与 `none_known` 混用。
 
 ### 7.0.2 FoodAllergen / FoodSafetyProfile / RecipeSafetyProfile
@@ -876,7 +884,7 @@ Recipe 食谱
 | `restrictionType` | — | `DECISION_REQUIRED` | V1 **仅**支持食物级禁忌（`foodItemId` / `allergenId` / `foodName`）；食材类别级限制不得视为一期已支持能力 |
 | `declarationSource` | `source` | `MAPPED` | 信息**来源**（谁提供/从哪录入）；与 `declarationType` 不可互替 |
 | `declarationType` | `declarationType` | `MAPPED` | 声明/确认**性质**（用户声明 vs 专业确认）；不决定限制是否生效 |
-| `foodName` | `foodName` | `MAPPED` | 用户可见食物名；无 `foodItemId` 时用于展示与 S1 文本级匹配（见 05 §5.3.1） |
+| `foodName` | `foodName` | `MAPPED` | 用户可见食物名；无 `foodItemId` 时用于展示与 S1 文本级匹配（见 05 §5.3.1—5.3.2） |
 | `evidenceReference` | `evidenceReference` | `MAPPED`（可选） | 依据引用，非医学诊断结论 |
 | `status` | `status` | `MAPPED` | **限制是否生效**（硬过滤开关）；仅 `active` / `inactive` |
 | `reviewStatus` | `reviewStatus` | `MAPPED` | **专业复核进度**；与限制是否生效分离；见下方枚举 |
@@ -926,7 +934,7 @@ Recipe 食谱
 - `not_required`：映射完整、无需排队专业复核（实现默认，当已绑定可靠 `foodItemId` 或 `allergenId` 时可选用）。
 - `pending_review`：待专业人员复核映射或记录准确性（如仅有 `foodName`、字典未命中）；**仍须**在 `status=active` 时执行 S1 硬过滤。
 - `reviewed`：已完成专业复核；**不改变** `status=active` 时的硬过滤行为。
-- `rejected`：专业复核不认可该限制；须走明确产品流程将 `status` 置为 `inactive`（或用户确认解除），**禁止**仅改 `reviewStatus` 而静默放开日程。
+- `rejected`：专业复核不认可该限制；**仅**更新审核结论，**不得**自动或连带修改 `status`。在 `status` 仍为 `active` 时**继续** S1 硬过滤，直至用户完成明确解除确认并将 `status` 置为 `inactive`（见 05 §5.3.3、SAF-10）。**禁止**专业人员、后台任务或审核自动化仅凭 `reviewStatus=rejected` 将 `status` 改为 `inactive`。
 
 **创建默认值（用户新增已知过敏项）**：
 
@@ -947,8 +955,8 @@ Recipe 食谱
 1. 用户声明已知过敏后是否立即硬过滤？— **是**（`status=active`）。
 2. `reviewStatus=pending_review` 时是否仍硬过滤？— **是**（当且仅当 `status=active`）。
 3. `professionally_confirmed` 与 `user_reported` 是否影响限制生效？— **否**（仅影响性质标注与流程，生效只看 `status`）。
-4. 何时可解除限制？— 用户明确解除或停用：`status=inactive`（及 05 规定的专业安全流程）；不得 AI 自动解除。
-5. 停用后是否重新校验未执行日程？— **是**（§7.0.1 约束 2）。
+4. 何时可解除限制？— **仅**用户明确确认后的解除或停用：`status=inactive`（及 05 §5.3.3、SAF-10）；`reviewStatus=rejected` **不是**解除依据；不得 AI 或审核侧自动解除。
+5. 停用后是否重新校验未执行日程？— **是**（§7.0.1 约束 2）；已执行历史不得追溯修改。
 
 说明：
 
@@ -1017,15 +1025,18 @@ Recipe 食谱
 | 字段             | 类型     | 必填 | 说明        |
 | ---------------- | -------- | ---- | ----------- |
 | `_id`            | string   | 是   | 记录 ID     |
-| `profileId`      | string   | 是   | 幼儿档案 ID |
-| `previousStatus` | string   | 否   | 修改前状态  |
+| `profileId`      | string   | 是   | 业务档案 ID |
+| `previousStatus` | string   | 否   | 修改前状态（档案级 `allergyStatus` 或禁忌项 `AllergyItem.status`） |
 | `nextStatus`     | string   | 是   | 修改后状态  |
-| `changeType`     | string   | 是   | 变更类型    |
-| `changedItems`   | array    | 否   | 变化的食物  |
-| `source`         | string   | 是   | 变更来源    |
+| `changeType`     | string   | 是   | 变更类型（如 `allergy_status_change`、`allergy_item_deactivated`、`allergy_item_created`） |
+| `changedItems`   | array    | 否   | 涉及的 `AllergyItem._id` 及变更摘要（含变更前后 `status` / `reviewStatus` 快照） |
+| `source`         | string   | 是   | 变更来源（含操作主体：如 `user_action` / `admin_on_behalf_with_user_confirm`；**不得**单独使用 `professional_review_reject` 作为将 `status` 置 `inactive` 的来源） |
+| `reason`         | string   | 否   | 用户确认依据或产品定义的解除原因摘要 |
 | `createdAt`      | datetime | 是   | 变更时间    |
 
-变更后必须触发未来未执行日程的安全校验。
+**解除限制审计（F-04.2）**：将 `AllergyItem.status` 从 `active` 变为 `inactive` 时**必须**写入一条 `AllergyChangeLog`，且 `changeType=allergy_item_deactivated`，`source` 须能区分用户本人确认与代操作；**不得**因 `reviewStatus` 变为 `rejected` 而省略用户确认步骤或省略本条日志。
+
+变更后必须触发未来未执行日程的安全校验；不得追溯修改已执行 `ScheduleTask` 的历史内容。
 
 ---
 

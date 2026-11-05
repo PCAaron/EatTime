@@ -459,12 +459,12 @@ L0 是不可被覆盖的硬约束。
 
 ### 9.2 过敏状态处理
 
-沿用产品已确认的四种过敏状态：
+沿用产品已确认的四种过敏状态。**`UserSafetyProfile.allergyStatus` 不决定 S1 硬过滤是否执行**；S1 仅以当前档案下 `AllergyItem.status=active` 为准（与 `specs/05-safety-rules.md` §5.3.1 一致）。
 
-| 状态                | 业务含义                     | 日程行为                             |
+| 状态                | 业务含义                     | 日程行为（除 S1 外）                 |
 | ------------------- | ---------------------------- | ------------------------------------ |
-| `none_known`        | 用户声明目前没有已知食物过敏 | 按正常流程生成，不代表医学排除过敏   |
-| `confirmed_allergy` | 用户声明存在已知过敏食物     | 建立禁忌清单，强制过滤               |
+| `none_known`        | 用户声明目前没有已知食物过敏 | 按正常流程生成；**不**表示无 active 禁忌项 |
+| `confirmed_allergy` | 用户声明存在已知过敏食物     | 引导维护禁忌清单；**不**作为 S1 唯一开关 |
 | `observing`         | 正在观察或尝试新食物         | 执行观察流程，避免未经安排的重复尝试 |
 | `skipped`           | 暂时跳过过敏信息设置         | 基础日程正常使用，不启动观察流程     |
 
@@ -472,18 +472,40 @@ L0 是不可被覆盖的硬约束。
 
 不得将用户跳过过敏信息设置理解为用户确认没有过敏。
 
-### 9.3 已知过敏食物过滤
+**强制约束**：
 
-当状态为 `confirmed_allergy` 时：
+1. 当前档案下**所有** `AllergyItem.status=active` 的记录均须执行 S1 硬过滤，与上表 `allergyStatus` 取值无关。
+2. 修改 `allergyStatus` **不得**自动将已有 `AllergyItem` 改为 `inactive`。
+3. `reviewStatus`、`declarationType`、`source` **不**决定是否执行 S1（见 05 §5.3.1）。
 
-1. 读取已知过敏食物清单。
-2. 检查食谱主料、辅料及复合食材。
-3. 检查食材的过敏原关联标签。
-4. 检查已知的交叉接触风险信息。
-5. 命中禁忌条件时，直接排除该食谱。
-6. 记录命中的安全规则和拦截原因。
+### 9.3 已知过敏食物过滤（S1）
+
+**入口（与 05 §5.3.1 一致）**：
+
+1. 读取当前档案有效禁忌：`AllergyItem.profileId` = 当前档案且 `status=active`（**不**依赖 `allergyStatus=confirmed_allergy`）。
+2. 对候选食谱/食材按 S1 命中规则检查（含 `foodItemId`、`allergenId`、`05` §5.3.2 `foodName` 文本匹配）。
+3. 检查食谱主料、辅料及已结构化展开的成分（`RecipeIngredient` 等，见 03 §6.1）。
+4. 检查食材的已审核过敏原关联（`FoodAllergen` / 已发布 `FoodItem.allergenCodes`）。
+5. 检查已知的交叉接触风险信息（可信状态为 `verified` 等，见 05 §6.4）。
+6. 命中禁忌或文本匹配结果为 `matched` 时，直接排除该食谱。
+7. 文本匹配结果为 `unresolved` 时，**不得**默认安全；须排除自动生成或进入待确认/审核流程（见 05 §5.3.2）。
+8. 记录命中的安全规则和拦截原因。
 
 **手动替换也必须执行同样的安全检查。**
+
+**场景验证（S1 × allergyStatus）**：
+
+| 场景 | `AllergyItem.status` | `allergyStatus` | 预期 |
+| --- | --- | --- | --- |
+| A | `active` | `confirmed_allergy` | 硬过滤 |
+| B | `active` | `skipped` | 硬过滤 |
+| C | `active` | `observing` | 硬过滤 |
+| D | `active` | `none_known` | 硬过滤 |
+| E | `inactive` | `confirmed_allergy` | 该条不再参与 S1；仍须遵守其他 L0 规则 |
+| F | `active` + `reviewStatus=pending_review` | `skipped` | 硬过滤 |
+| G | `active` + `reviewStatus=rejected` | `none_known` | 硬过滤，直至用户合法解除为 `inactive` |
+
+当 `allergyStatus=confirmed_allergy` 时，产品仍应引导用户维护禁忌清单，但**不得**将「非 confirmed_allergy」理解为可跳过已存在的 active 禁忌项。
 
 如果复合食品的配料信息不完整，无法判断是否包含已知禁忌成分，应进入风险待审核或排除流程，不得默认安全。
 

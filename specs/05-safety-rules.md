@@ -313,7 +313,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 1. 用户声明必须保留原始含义。
 2. 不允许自动把用户声明升级为医学确诊（`declarationType` 不得自动变为 `professionally_confirmed`）。
 3. 不允许 AI 自动解除禁忌。
-4. 解除禁忌必须经过明确用户操作（`status=inactive`），并按产品定义的专业安全流程处理。
+4. 解除禁忌必须经过明确用户操作（`status=inactive`），见 §5.3.3 与 SAF-10；专业人员审核拒绝不能替代该操作。
 5. 已失效记录（`status=inactive`）仍应保留历史审计信息。
 6. 用户新增已知过敏项时默认 `status=active`；不得因等待专业复核而暂时放开硬过滤。
 
@@ -330,7 +330,7 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 1. 食谱（含配料展开）关联的 `foodItemId` 与禁忌项 `foodItemId` 相同。
 2. 食谱关联食材经已审核 `FoodAllergen` 映射，与禁忌项 `allergenId` 相同。
-3. 禁忌项仅有 `foodName`（或映射待复核）：按产品定义的保守文本/别名匹配规则命中该食物或其已审核别名；**不得**因 `reviewStatus=pending_review` 跳过。
+3. 禁忌项仅有 `foodName`（或映射待复核）：按 **§5.3.2** 确定性文本/已审核别名规则；结果为 `matched` 时 block；`unresolved` 时不得默认放行；**不得**因 `reviewStatus=pending_review` 跳过。
 4. V1 **不支持**类别级 `restrictionType` 的自动硬过滤；若未来扩展须单独产品决议并更新 02/05。
 
 **明确问答**：
@@ -340,10 +340,109 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 | 用户声明已知过敏后是否立即硬过滤？ | **是**（创建时 `status=active`） |
 | `reviewStatus=pending_review` 时是否仍硬过滤？ | **是**（当 `status=active`） |
 | `user_reported` 与 `professionally_confirmed` 是否影响生效？ | **否**（仅标注与流程） |
-| 如何解除限制？ | 用户明确操作置 `status=inactive`（及 SAF-10 等专业流程）；禁止 AI 自动解除 |
+| 如何解除限制？ | **仅**用户明确确认后 `status=inactive`（§5.3.3、SAF-10）；`reviewStatus=rejected` 不能代替用户确认 |
 | 限制变更后是否重新校验未执行日程？ | **是**（§14、02 §7.0.1） |
 
-**变更触发**：`AllergyItem` 的 `status`、`foodItemId`、`allergenId`、`foodName` 或关联 `UserSafetyProfile.allergyStatus` 变更后，须重新校验未来未执行 `ScheduleTask`。
+**变更触发**：`AllergyItem` 的 `status`、`foodItemId`、`allergenId`、`foodName` 或关联 `UserSafetyProfile.allergyStatus` 变更后，须重新校验未来未执行 `ScheduleTask`；**不得**追溯修改已执行历史。
+
+**与 `allergyStatus` 的关系**：
+
+1. 无论 `UserSafetyProfile.allergyStatus` 为 `none_known`、`confirmed_allergy`、`observing` 或 `skipped`，凡 `status=active` 的 `AllergyItem` **均**进入 S1。
+2. 修改 `allergyStatus` **不得**自动将 `AllergyItem` 置为 `inactive`。
+3. `confirmed_allergy` 用于产品与观察/引导流程，**不是** S1 查询条件。
+
+**S1 × allergyStatus 场景验证**（与 04 §9.3 一致）：
+
+| 场景 | `AllergyItem.status` | `allergyStatus` | 预期 |
+| --- | --- | --- | --- |
+| A | `active` | `confirmed_allergy` | 硬过滤 |
+| B | `active` | `skipped` | 硬过滤 |
+| C | `active` | `observing` | 硬过滤 |
+| D | `active` | `none_known` | 硬过滤 |
+| E | `inactive` | `confirmed_allergy` | 该条不参与 S1 |
+| F | `active` + `pending_review` | `skipped` | 硬过滤 |
+| G | `active` + `rejected` | `none_known` | 硬过滤，除非已合法 `inactive` |
+
+### 5.3.2 S1 `foodName` 确定性文本匹配
+
+当禁忌项缺少可靠 `foodItemId` / `allergenId` 绑定，或需对候选内容名称与声明文本比对时，执行本节规则。**不得**使用模糊相似度、编辑距离或 NLP 语义等价自动认定两种食物相同。
+
+**1. 原始声明**
+
+- `AllergyItem.foodName` 保存用户原始输入，**不得**被标准化结果覆盖。
+- 匹配计算使用派生键（见下文「标准化」），与持久化字段分离。
+
+**2. 标准化（确定性，按序应用）**
+
+对参与比对的字符串（用户 `foodName` 派生键、标准名、已审核别名）依次：
+
+1. 去除首尾空白（Unicode trim）。
+2. 将连续空白（含全角空格）折叠为单个半角空格。
+3. 全角 ASCII 字母数字及常见标点（如 `，`、`（`）映射为对应半角（若已是半角则不变）。
+4. 英文字母 `A—Z` 统一为小写（**仅** ASCII 字母；中文不变）。
+5. 去除首尾及词间**约定标点**：`，`、`,`、`、`、`、`·`、`-`（连字符）、`/`（**不**删除括号内语义字符，避免误合并不同食物）。
+
+**禁止**：拼音归一、简繁自动转换、Levenshtein/余弦相似度、未审核用户输入写入标准别名库。
+
+**3. 可信名称与别名来源**
+
+| 来源 | 条件 | 用途 |
+| --- | --- | --- |
+| `FoodItem.name` | `FoodItem.status` 为可进入生产推荐池的已发布状态（见 03 §4.5、02 §5.1.1） | 标准食材名 |
+| `FoodItem.aliases[]` | 所属 `FoodItem` 满足上表发布条件 | 已审核食材别名 |
+| `FoodAllergen.allergenName` / `aliases[]` | `FoodAllergen.status=active` 且字典项已完成内容审核发布（见 §5.4、`03` §4.4） | 过敏原标准名与别名 |
+
+未发布、草稿或未审核通过的别名**不得**用于自动 `not_matched` 放行。
+
+**4. 匹配流程（对单条 active 禁忌 vs 单个候选食材/名称）**
+
+1. 若禁忌已绑定 `foodItemId`：候选 `foodItemId` 相同 → `matched`；否则对候选展开成分后再比 ID。
+2. 若禁忌已绑定 `allergenId`：按 §5.3.1 第 2 条（已审核 `FoodAllergen` 映射）→ `matched` 或继续。
+3. 否则对禁忌 `foodName` 派生键与标准名/已审核别名派生键做**完全相等**比对 → 任一相等为 `matched`。
+4. 若候选为食谱且存在结构化 `RecipeIngredient`（03 §6.1）：对每个 `foodItemId` 重复步骤 1—2；对仅名称无 ID 的成分，按步骤 3 与禁忌文本比。
+5. 若候选为复合食品/食谱且**缺少**可展开的结构化成分：**不得**仅凭复合食品名称推断不含过敏原 → 对该禁忌判定为 `unresolved`（就本候选）。
+6. 若存在多个标准实体同名歧义（同一派生键命中多条未关联 ID 的标准记录）→ `unresolved`。
+7. 若完成 1—6 且未 `matched`、且所有必要数据完整可信 → `not_matched`；否则 → `unresolved`。
+
+**5. 逻辑结果与日程行为**
+
+| 结果 | 含义 | 自动推荐 / 日程生成 |
+| --- | --- | --- |
+| `matched` | 确定命中有效禁忌 | 硬过滤，禁止进入候选 |
+| `not_matched` | 依据完整可信数据确定未命中该条禁忌 | 可继续其他 L0 校验 |
+| `unresolved` | 信息不足、歧义或无法可靠判断 | **不得**当作 `not_matched` 放行；排除自动生成或待确认 |
+
+**6. 别名治理与版本**
+
+- 别名仅随 `FoodItem` / `FoodAllergen` 主数据审核发布；变更须可追溯 `reviewedBy`、`reviewedAt`、`version`（见 §5.4、03 §4.4）。
+- **不**新增独立别名集合；若未来需要独立别名审核流水，记为产品待决策项。
+
+**7. 测试场景（规则层，供用例设计）**
+
+1. 用户输入与标准 `FoodItem.name` 完全一致 → `matched`。
+2. 用户输入与已发布 `FoodItem.aliases` 某项一致 → `matched`。
+3. 用户输入与内容库中**未发布**或草稿别名一致 → 不得仅凭此 `not_matched`；通常 `unresolved` 直至映射或 ID 绑定。
+4. 全角/半角及空格差异 → 标准化后相等 → `matched`。
+5. 英文大小写差异 → `matched`。
+6. 相似但不同的名称（如不同食材）→ 无审核别名时不相等 → `not_matched` 或 `unresolved`（视候选数据完整性）。
+7. 复合食谱有结构化成分且含受限 `foodItemId` → `matched`。
+8. 复合食谱有结构化成分且不含受限项 → `not_matched`（对该禁忌）。
+9. 复合食谱缺少成分数据 → `unresolved`。
+10. 成分名称无法映射到标准库 → `unresolved`。
+11. 用户原始输入无法匹配任何已发布标准名/别名 → 对涉及该名称的候选倾向 `unresolved`；对已绑定 ID 的禁忌仍按 ID `matched`。
+
+### 5.3.3 专业审核拒绝与解除限制
+
+**权限边界（F-04.2）**：
+
+1. `reviewStatus=rejected` **仅**表示专业复核结论，**不得**自动修改 `AllergyItem.status`。
+2. 专业人员、后台审核任务或自动化 **不得**仅凭将 `reviewStatus` 设为 `rejected` 把 `status` 改为 `inactive`。
+3. 在 `status=active` 期间（含 `reviewStatus=rejected`），S1 **继续**硬过滤。
+4. **仅**用户在产品内完成明确解除确认（及 SAF-10 规定的安全流程）后，方可将 `status` 更新为 `inactive`。
+5. 解除须写入 `AllergyChangeLog`（02 §7.4）：操作主体、时间、原因/确认依据、变更前后状态。
+6. 解除后须重新校验未来未执行 `ScheduleTask`；已执行历史不得追溯修改。
+
+专业审核拒绝后，产品可向用户展示复核结论并引导确认是否解除声明；在用户确认前，生效限制仍以 `status=active` 为准。
 
 ### 5.4 FoodAllergen
 
@@ -483,10 +582,10 @@ FoodItem
 
 | 状态                | 用户含义                     | 系统行为         |
 | ------------------- | ---------------------------- | ---------------- |
-| `none_known`        | 用户声明目前没有已知食物过敏 | 正常生成基础日程 |
-| `confirmed_allergy` | 用户声明存在需要回避的食物   | 启用禁忌过滤     |
+| `none_known`        | 用户声明目前没有已知食物过敏 | 正常生成基础日程；**不**取消已有 active 禁忌的 S1 |
+| `confirmed_allergy` | 用户声明存在需要回避的食物   | 引导维护禁忌清单；S1 以 `AllergyItem.status=active` 为准，**非**本状态开关 |
 | `observing`         | 用户正在观察或记录新食物     | 启用观察记录     |
-| `skipped`           | 暂时不填写，之后再设置       | 基础功能正常使用 |
+| `skipped`           | 暂时不填写，之后再设置       | 基础功能正常使用；**不**忽略已有 active 禁忌的 S1 |
 
 `none_known` 不代表医学上排除了所有食物过敏。
 

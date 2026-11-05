@@ -872,7 +872,10 @@ Agent 必须：
 | 02/05 `UserSafetyProfile` 字段名一致 | `profileType`、`informationSource` 等 | — | — | PASS |
 | 过敏四种状态单一存储归属 | `UserSafetyProfile.allergyStatus` | — | — | PASS |
 | 05 AllergyRestriction 与 02 字段映射完整 | §7.2 逐字段 + `declarationType`/`reviewStatus` | — | — | PASS |
-| S1 硬过滤不依赖 `reviewStatus` | `status=active` 唯一开关；02 §7.2、05 §5.3.1 | — | — | PASS（文档已修订，**待独立复核**） |
+| S1 硬过滤不依赖 `reviewStatus` | `status=active` 唯一开关；02 §7.2、05 §5.3.1 | — | — | PASS |
+| S1 不依赖 `allergyStatus` | active `AllergyItem` 全状态硬过滤；02 §7.0.1、04 §9.2—9.3、05 §5.3.1 | — | — | PASS（F-04.2） |
+| `foodName` 确定性匹配 | 05 §5.3.2；`unresolved` 不得放行 | — | — | PASS（F-04.2） |
+| 审核拒绝不自动解除 | 02 §7.2、§7.4；05 §5.3.3 | — | — | PASS（F-04.2） |
 | `restrictionType` 类别级 V1 范围 | 不得伪装为已支持；02 `DECISION_REQUIRED` | — | — | PARTIAL |
 | 06 过敏集合与 02 一致 | 无第二套档案集合（`allergy_profiles` 仅废弃说明） | — | — | PASS |
 | 任务状态 blocked/expired 与 02 对齐 | statusReason 映射 | — | PASS | — |
@@ -910,5 +913,19 @@ Agent 必须：
 **F-04 总判定**：`PARTIAL PASS` — 持久化单模型、S1 语义与字段映射已在 Spec 闭环；**尚未**经 F-04.1 修订后的独立全文复核；剩余 **`AllergyRestriction.restrictionType` 食材类别级**若一期需要独立存储，需产品确认是否扩展 `AllergyItem` 或另规实体（当前 V1 以食物项为主）。
 
 **F-04.1 修订摘要（2026-11-05）**：新增 `AllergyItem.reviewStatus`；`status` 仅 `active`/`inactive`；05 新增 §5.3.1 S1 硬过滤读取规则。
+
+### 15.4 F-04.2 定点修复（过敏过滤入口 / 文本匹配 / 解除权限）
+
+复核方法：人工重读 02 §7.0.1、§7.2、§7.4；04 §9.2—9.3；05 §5.3.1—5.3.3、§7.1；全文检索 `confirmed_allergy`（S1 入口语境）、`foodName`、`matched`/`unresolved`、`reviewStatus=rejected` + `inactive`。**未**执行代码或自动化测试。
+
+| 子项 | 优先级 | 结论 | 文档证据 |
+| --- | --- | --- | --- |
+| F-04.2-01 过滤入口与 `allergyStatus` 冲突 | P1 | **PASS**（文档定义） | 02 §7.0.1 职责分离；04 §9.2—9.3 S1 入口与场景表；05 §5.3.1 与 `allergyStatus` 关系及场景表 |
+| F-04.2-02 `foodName` 文本匹配 | P1 | **PASS**（文档定义） | 05 §5.3.2 标准化、来源、流程、`matched`/`not_matched`/`unresolved` 及 11 条测试场景；04 §9.3 引用；02 §7.2 `foodName` 保留原值 |
+| F-04.2-03 审核拒绝 vs 解除权限 | P2 | **PASS**（文档定义） | 02 §7.2 `rejected` 语义、§7.4 解除审计；05 §5.3.3；与 §5.3.1 解除问答一致 |
+
+**F-04.2 总判定**：**PASS（Spec 层）** — 三问题已在 02/04/05 交叉对齐；**尚未**经实现层或集成测试验证。SAF-10 交互细节仍为产品待办，但不影响上述权限边界定义。
+
+**与 F-04 / F-04.1 关系**：F-04.1 字段映射与 S1/`reviewStatus` 拆分结论保持不变；F-04 主表仍为 **PARTIAL**（`restrictionType` 类别级 V1 等待决策），不因 F-04.2 单独改为 RESOLVED。
 
 **安全规则**：05 执行约束未因字段收口而删除；四种状态语义与 07 §2 决策表一致。

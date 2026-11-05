@@ -858,7 +858,7 @@ Agent 必须：
 | --- | --- | --- | --- | --- |
 | F-02 | 内容状态枚举及生命周期 | 枚举：02 §5.1.1；迁移与推荐池：03 §12 | RESOLVED | PRD 改为引用；统一 `pending_review`；`expired` 为动态条件非主 status |
 | F-03 | 日程逻辑实体与持久化映射 | 02 §6.0；04 §3.1.1；06 §10.1.0 | RESOLVED | Plan/Day/Slot 非持久化；`ScheduleTask` 增加 `slotCode`；`schedules`↔`ScheduleInstance` |
-| F-04 | 过敏安全双模型 | 02 §7.0；05 §5；06 §10.1.0 | RESOLVED | 仅 `user_safety_profiles`；`AllergyProfile` 为逻辑别名；SAF-08 → 02 §7.0.3 |
+| F-04 | 过敏安全双模型 | 02 §7.0—§7.2；05 §5.2—5.3；06 §10.1.0 | RESOLVED | 单一持久化：`user_safety_profiles` / `allergy_items` / `food_observations`；`AllergyProfile` 仅 §7.1 别名；独立复核见 §15.3 |
 
 ### 15.1 修复后检查矩阵（F-02—F-04）
 
@@ -866,8 +866,13 @@ Agent 必须：
 | --- | --- | --- | --- | --- |
 | 内容 status 跨 PRD/02/03 一致 | 无独立冲突枚举 | PASS | — | — |
 | 逻辑日程实体均有持久化或非持久化说明 | 无悬空实体 | — | PASS | — |
+| ER 图无独立 `AllergyProfile` 持久化链 | `Profile`→`UserSafetyProfile`→`AllergyItem` | — | — | PASS |
+| 实体清单无重复持久化过敏档案 | 仅 `UserSafetyProfile` | — | — | PASS |
+| 无 `AllergyProfile` 独立字段表 | §7.1 仅为别名映射 | — | — | PASS |
+| 02/05 `UserSafetyProfile` 字段名一致 | `profileType`、`informationSource` 等 | — | — | PASS |
 | 过敏四种状态单一存储归属 | `UserSafetyProfile.allergyStatus` | — | — | PASS |
-| 05 AllergyRestriction 与 02 可对齐 | 映射 AllergyItem | — | — | PASS |
+| 05 AllergyRestriction 与 02 可对齐 | §7.2 逐字段映射 | — | — | PASS |
+| 06 过敏集合与 02 一致 | 无第二套档案集合（`allergy_profiles` 仅废弃说明） | — | — | PASS |
 | 任务状态 blocked/expired 与 02 对齐 | statusReason 映射 | — | PASS | — |
 
 关联未本轮处理：F-07（06 全量集合与 02 逐一对账）。
@@ -883,3 +888,21 @@ Agent 必须：
 | DM-05 / DM-06 | 版本引用 ID + 独立 `allergy_items` | 02 §15 | 已采纳 |
 
 仍须产品/专业输入：DM-01—04、DM-07—12，SAF-01—07、SAF-09—12（字典条目与文案，非数据模型形状）。
+
+### 15.3 F-04 独立复核记录（过敏安全数据模型收口）
+
+复核方法：人工重读 02 §2.2—§2.3、§7.0—§7.2、§10.4、§11；05 §5.2—5.3；06 §10.1.0；全文检索 `AllergyProfile`、`allergy_profiles`、`AllergyRestriction`、`domain`（档案字段语境）、`knownAllergies` / `observations`（持久化语境）。**未**将「文档曾标记 RESOLVED」视为通过依据。
+
+| 子项 | 结论 | 文档证据 |
+| --- | --- | --- |
+| F-04-A ER 图 | PASS | 02 §2.2：`USER_SAFETY_PROFILE`，无 `ALLERGY_PROFILE` |
+| F-04-B 实体清单 | PASS | 02 §2.3：无独立 `AllergyProfile` 一期实体行 |
+| F-04-C `AllergyProfile` 字段表 | PASS | 02 §7.1：别名映射表，无独立持久化字段表 |
+| F-04-D `UserSafetyProfile` 字段 | PASS | 02 §7.0.1 与 05 §5.2 字段名一致；投影单独标注 |
+| F-04-E `AllergyRestriction` 映射 | PARTIAL | 02 §7.2 完整映射；`restrictionType` 类别级限制仍待产品决策（表内已标注） |
+| F-04-F 06 集合映射 | PASS | 06 §10.1.0 与 02 §11 一致；`allergy_profiles` 仅废弃说明 |
+| F-04-G 07 审查状态 | PASS | 本表与 §15.1 矩阵 |
+
+**F-04 总判定**：`PARTIAL PASS` — 持久化单模型与跨文档字段已收口；剩余 `AllergyRestriction.restrictionType` 中「食材类别级」禁忌若一期需要独立存储，需产品确认是否扩展 `AllergyItem` 或另规实体（当前 V1 以食物项为主）。
+
+**安全规则**：05 执行约束未因字段收口而删除；四种状态语义与 07 §2 决策表一致。

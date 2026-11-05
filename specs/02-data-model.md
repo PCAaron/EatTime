@@ -76,7 +76,7 @@
 | 阶段管理域   | PregnancyProfile、ChildProfile、StageSnapshot            | 孕期及幼儿阶段识别           |
 | 内容管理域   | FoodItem、Recipe、RecipeIngredient                       | 食材及食谱内容               |
 | 日程执行域   | ScheduleInstance、ScheduleTask、TaskActionLog            | 日程生成及执行               |
-| 安全管理域   | UserSafetyProfile、AllergyProfile、AllergyItem、FoodObservation、FoodAllergen、FoodSafetyProfile、RecipeSafetyProfile、SafetyRule | 过敏约束、观察记录及安全规则 |
+| 安全管理域   | UserSafetyProfile、AllergyItem、FoodObservation、FoodAllergen、FoodSafetyProfile、RecipeSafetyProfile、SafetyRule（`AllergyProfile` 为 §7.1 历史逻辑别名，非独立实体） | 过敏约束、观察记录及安全规则 |
 | 系统追溯域   | RuleVersion、ContentVersion、BusinessEvent               | 规则、内容版本及业务事件     |
 
 ### 2.2 实体关系总览
@@ -97,8 +97,8 @@ erDiagram
     RECIPE ||--|{ RECIPE_INGREDIENT : contains
     FOOD_ITEM ||--o{ RECIPE_INGREDIENT : used_in
 
-    PROFILE ||--o| ALLERGY_PROFILE : has
-    ALLERGY_PROFILE ||--o{ ALLERGY_ITEM : contains
+    PROFILE ||--|| USER_SAFETY_PROFILE : has_one
+    USER_SAFETY_PROFILE ||--o{ ALLERGY_ITEM : contains
 
     PROFILE ||--o{ FOOD_OBSERVATION : records
     FOOD_ITEM ||--o{ FOOD_OBSERVATION : observed
@@ -115,7 +115,8 @@ erDiagram
 - `Profile` 是业务档案的统一入口。
 - `PregnancyProfile` 和 `ChildProfile` 分别保存领域特有信息。
 - 日程及任务必须关联生成时使用的内容版本和规则版本。
-- 观察记录和过敏信息必须归属于具体幼儿档案，不能仅关联用户账号。
+- 每个 `Profile` 至多一条 `UserSafetyProfile`（孕期与幼儿档案均适用）；已知过敏明细经 `AllergyItem` 关联同一 `profileId` / `userSafetyProfileId`。
+- `FoodObservation` 通过 `profileId` 归属业务档案（一期主要用于幼儿新食物观察），不能仅关联用户账号。
 
 ### 2.3 一期实体清单
 
@@ -132,9 +133,8 @@ erDiagram
 | ScheduleInstance | 是           | 日程实例           |
 | ScheduleTask     | 是           | 日程任务           |
 | TaskActionLog    | 是           | 任务操作历史       |
-| AllergyProfile   | 是           | 幼儿过敏信息状态（与 UserSafetyProfile 同步，见 §7.0） |
-| UserSafetyProfile | 是        | 每档案用户安全档案（过敏状态权威存储） |
-| AllergyItem      | 是           | 已知过敏食物清单   |
+| UserSafetyProfile | 是        | 每档案用户安全档案（过敏状态权威存储；`AllergyProfile` 仅为 §7.1 逻辑别名，非独立持久化实体） |
+| AllergyItem      | 是           | 已知过敏食物清单（05 逻辑名 `AllergyRestriction`）   |
 | FoodObservation  | 是           | 新食物观察记录     |
 | SafetyRule       | 是           | 安全规则           |
 | RuleVersion      | 是           | 规则版本           |
@@ -771,7 +771,7 @@ Recipe 食谱
 - `AllergyRestriction`（05 §5.3）→ 持久化为 `AllergyItem`；05 名称为规则层别名。
 - `FoodAllergen`、`FoodSafetyProfile`、`RecipeSafetyProfile`（05 §5.4—5.6）→ 上表实体；过滤时只读已审核发布数据。
 
-**四种过敏状态存储归属**：仅存于 `UserSafetyProfile.allergyStatus`（枚举见 §7.1）。
+**四种过敏状态存储归属**：仅存于 `UserSafetyProfile.allergyStatus`（枚举见 §7.0.1）。
 
 **集合决议（已采纳）**：一期**仅**使用集合 `user_safety_profiles` 存储 `UserSafetyProfile`。**不再**新建或读写 `allergy_profiles` 集合。文档中的 `AllergyProfile` 指同一数据的**逻辑别名**（多指幼儿档案场景），不是第二个持久化实体。
 
@@ -788,12 +788,27 @@ Recipe 食谱
 | `_id` | string | 是 | 安全档案 ID |
 | `profileId` | string | 是 | 对应 Profile |
 | `profileType` | string | 是 | `pregnancy` / `child` |
-| `allergyStatus` | string | 是 | 四种状态，见 §7.1 |
+| `allergyStatus` | string | 是 | 四种状态，见下文 |
 | `declaredRestrictions` | array | 否 | 用户声明的额外限制项，元素结构见 §7.0.3 |
-| `informationSource` | string | 否 | 信息来源 |
+| `informationSource` | string | 否 | 信息来源；建议：`user_declaration` / `professional_record` / `other` |
+| `declaredAt` | datetime | 否 | 用户首次完成过敏信息声明的时间（可选） |
 | `version` | number | 是 | 安全档案版本（变更后递增） |
 | `updatedAt` | datetime | 是 | 更新时间 |
 | `updatedBy` | string | 是 | 修改来源 |
+
+`allergyStatus` 取值与语义：
+
+- `none_known`：用户声明目前没有已知食物过敏（不等于医学排除所有过敏）。
+- `confirmed_allergy`：存在需按禁忌处理的已知过敏声明（不等于产品侧医学诊断）。
+- `observing`：存在新食物观察行为；不代表医学上确诊或排除过敏。
+- `skipped`：用户暂时不设置过敏信息；不得与 `none_known` 混用，不得自动转换为 `none_known`。
+
+说明：
+
+1. 具体过敏食物由 `AllergyItem` 保存；观察明细由 `FoodObservation` 保存。
+2. 用户修改 `allergyStatus` 时应写入 `AllergyChangeLog`（§7.4），保留历史。
+3. `skipped` 不阻塞建档与基础日程（见 05）。
+4. 若涉及专业记录，`informationSource` 应能表达来源类型；不应默认要求用户上传完整医疗资料。
 
 约束：
 
@@ -830,66 +845,61 @@ Recipe 食谱
 3. 参与 L0 自动过滤的声明：`status=active` 且 `restrictionCode` 对应规则已发布且生效。
 4. `freeTextNote` 仅展示与审计，供专业人员后续处理，不进入自动推荐算法。
 
-### 7.1 AllergyProfile（逻辑别名，非独立集合）
+### 7.1 AllergyProfile（历史逻辑别名，非持久化实体）
 
-用途：文档与接口中对「幼儿档案过敏信息头」的称呼，**持久化数据即 `UserSafetyProfile`（同 `profileId`）**。读取 `status` 时等同于 `UserSafetyProfile.allergyStatus`。
+`AllergyProfile` **不是**独立持久化实体，**不得**创建或读写 `allergy_profiles` 集合。历史文档、接口或口语中的该名称均指与 `Profile` 一一对应的 **`UserSafetyProfile`**（同 `profileId`）。
 
-以下字段表描述与 §7.0.1 同步的语义，**实现不得再写入 `allergy_profiles` 集合**。
+| 历史/逻辑名 | 规范实体与字段 | 处理方式 |
+| --- | --- | --- |
+| `AllergyProfile` 整体 | `UserSafetyProfile` | 读写均走 `user_safety_profiles` |
+| `status` | `UserSafetyProfile.allergyStatus` | 同义，权威字段见 §7.0.1 |
+| `informationSource` | `UserSafetyProfile.informationSource` | 同义 |
+| `declaredAt` | `UserSafetyProfile.declaredAt` | 同义（可选） |
+| `updatedAt` / `updatedBy` | `UserSafetyProfile.updatedAt` / `updatedBy` | 同义 |
+| 已知过敏明细 | `AllergyItem` | 不得嵌入档案头重复存储 |
+| 观察记录 | `FoodObservation` | 独立集合，见 §7.3 |
 
-| 字段                | 类型     | 必填 | 说明             |
-| ------------------- | -------- | ---- | ---------------- |
-| `_id`               | string   | 是   | 记录 ID          |
-| `profileId`         | string   | 是   | 幼儿档案 ID      |
-| `status`            | string   | 是   | 与 `UserSafetyProfile.allergyStatus` 同义，权威见 §7.0 |
-| `informationSource` | string   | 否   | 信息来源         |
-| `declaredAt`        | datetime | 否   | 用户声明时间     |
-| `updatedAt`         | datetime | 是   | 更新时间         |
-| `updatedBy`         | string   | 是   | 修改来源         |
-
-状态：
-
-- `none_known`
-- `confirmed_allergy`
-- `observing`
-- `skipped`
-
-说明：
-
-1. `AllergyProfile` 记录当前状态。
-2. 具体过敏食物由 AllergyItem 保存。
-3. `none_known` 只表示用户声明目前没有已知食物过敏。
-4. `skipped` 表示用户暂时不设置。
-5. 不得将 `skipped` 自动转换为 `none_known`。
-6. 用户修改状态时需要保留历史记录。
-7. `observing` 表示存在观察行为，不代表医学上确诊或排除过敏。
-
-`informationSource` 建议：
-
-- `user_declaration`
-- `professional_record`
-- `other`
-
-如果涉及专业记录，应保留必要的来源说明及核验信息，但不应默认要求用户上传完整医疗资料。
+**禁止**：为 `AllergyProfile` 单独维护第二套字段表或集合；实现层不得双写 `allergy_profiles` 与 `user_safety_profiles`。
 
 ### 7.2 AllergyItem 已知过敏食物
 
-用途：保存用户声明的已知过敏食物及对应信息（**对应 05 中的 AllergyRestriction 逻辑**）。
+用途：保存用户声明的已知过敏食物及对应信息（**对应 05 §5.3 中的 `AllergyRestriction` 逻辑名**；持久化仅此实体）。
+
+**05 `AllergyRestriction` → `AllergyItem` 字段映射**：
+
+| 05 逻辑字段 | 02 规范字段 | 处理方式 | 说明 |
+| --- | --- | --- | --- |
+| `restrictionId` | `_id` | 映射 | 禁忌记录主键 |
+| `profileId` | `profileId` | 保留 | 业务档案 |
+| `foodItemId` | `foodItemId` | 保留 | 标准食材（条件必填） |
+| `allergenId` | `allergenId` | 保留（可选） | 关联 `FoodAllergen`；无食材 ID 时可单独引用过敏原 |
+| `restrictionType` | — | 业务语义 | V1 以具体 `foodItemId` / `foodName` 表达食物级禁忌；类别级限制若需独立建模待产品决策 |
+| `declarationSource` | `source` | 映射 | 声明来源 |
+| `evidenceReference` | `evidenceReference` | 保留（可选） | 依据引用，非医学诊断结论 |
+| `status` | `status` | 映射 | 含 `pending_review` 时见下方枚举 |
+| `declaredAt` | `createdAt` | 映射 | 首次声明时间以创建时间为准；更新见 `updatedAt` |
+| `updatedAt` | `updatedAt` | 保留 | |
+| `notes` | `notes` | 保留 | 用户补充说明 |
 
 建议字段：
 
 | 字段               | 类型     | 必填     | 说明            |
 | ------------------ | -------- | -------- | --------------- |
 | `_id`              | string   | 是       | 记录 ID         |
-| `profileId`        | string   | 是       | 幼儿档案 ID     |
-| `allergyProfileId` | string   | 是       | 过敏信息档案 ID |
+| `profileId`        | string   | 是       | 业务档案 ID     |
+| `userSafetyProfileId` | string | 是    | 对应 `UserSafetyProfile._id` |
 | `foodItemId`       | string   | 条件必填 | 标准食材 ID     |
 | `foodName`         | string   | 条件必填 | 食物名称        |
+| `allergenId`       | string   | 否       | 标准过敏原 ID（`FoodAllergen`） |
 | `declarationType`  | string   | 是       | 信息类型        |
-| `source`           | string   | 否       | 信息来源        |
+| `source`           | string   | 否       | 信息来源（对应 05 `declarationSource`） |
+| `evidenceReference` | string  | 否       | 可选依据引用    |
 | `status`           | string   | 是       | 当前记录状态    |
 | `notes`            | string   | 否       | 补充说明        |
 | `createdAt`        | datetime | 是       | 创建时间        |
 | `updatedAt`        | datetime | 是       | 更新时间        |
+
+> 历史字段名 `allergyProfileId` 已废弃，统一为 `userSafetyProfileId`。
 
 `declarationType`：
 
@@ -907,6 +917,7 @@ Recipe 食谱
 
 - `active`
 - `inactive`
+- `pending_review`（待审核；不参与生产硬过滤直至转为 `active` 或 `inactive`）
 
 停用记录应保留历史，不直接物理删除。
 
@@ -919,7 +930,7 @@ Recipe 食谱
 | 字段                  | 类型     | 必填 | 说明         |
 | --------------------- | -------- | ---- | ------------ |
 | `_id`                 | string   | 是   | 观察记录 ID  |
-| `profileId`           | string   | 是   | 幼儿档案 ID  |
+| `profileId`           | string   | 是   | 业务档案 ID  |
 | `foodItemId`          | string   | 否   | 标准食材 ID  |
 | `foodName`            | string   | 是   | 食物名称     |
 | `attemptedAt`         | datetime | 是   | 尝试时间     |
@@ -1164,7 +1175,7 @@ Recipe 食谱
 
 过敏信息变更必须：
 
-1. 更新当前 AllergyProfile。
+1. 更新 `UserSafetyProfile`（含 `allergyStatus` 等，见 §7.0.1）。
 2. 更新对应 AllergyItem。
 3. 记录 AllergyChangeLog。
 4. 触发未来未执行任务重新校验。
@@ -1228,7 +1239,7 @@ Recipe 食谱
 例如：
 
 - `RecipeIngredient` 可以独立集合，也可以在食谱版本快照中嵌套保存。
-- `AllergyItem` 如果数量较少，也可以嵌入 AllergyProfile，但必须确保能够独立进行安全过滤和更新。
+- `AllergyItem` 应独立集合或等价独立可读结构；**不得**仅为省集合而嵌入 `UserSafetyProfile` 并丧失按项安全过滤与更新能力。
 - `TaskActionLog` 建议独立保存，以便保留操作历史。
 - `ContentVersion` 和 `RuleVersion` 建议独立保存，避免发布版本被覆盖。
 

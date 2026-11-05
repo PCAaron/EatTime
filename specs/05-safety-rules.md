@@ -250,24 +250,31 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 ### 5.2 UserSafetyProfile
 
-用户安全档案（**持久化**：`UserSafetyProfile`，集合 `user_safety_profiles`，见 02 §7.0.1）。
+用户安全档案（**持久化字段以 `specs/02-data-model.md` §7.0.1 为唯一权威**；集合 `user_safety_profiles`）。
 
-一个 Profile 对应独立的安全档案，不允许将不同孕期或幼儿档案的过敏信息混用。
+一个 `Profile` 对应一条 `UserSafetyProfile`，不允许将不同孕期或幼儿档案的过敏信息混用。
 
-建议字段：
+**规范持久化字段**（与 02 §7.0.1 一致，不得另起字段名）：
 
-| 字段                 | 类型建议 | 说明               |
-| -------------------- | -------- | ------------------ |
-| safetyProfileId      | string   | 安全档案 ID        |
-| profileId            | string   | 对应用户业务档案   |
-| domain               | enum     | pregnancy / child  |
-| allergyStatus        | enum     | 过敏状态（**唯一存储归属**，与 02 一致） |
-| declaredRestrictions | array    | 用户声明的额外限制，元素结构见 02 §7.0.3 |
-| knownAllergies       | array    | 已知过敏食物（**查询时以 AllergyItem 为准**，此字段可为展示冗余） |
-| observations         | array    | 食物观察（**持久化以 FoodObservation 为准**） |
-| source               | enum     | 信息来源           |
-| updatedAt            | datetime | 最近更新时间       |
-| version              | number   | 安全档案版本       |
+| 字段 | 类型建议 | 说明 |
+| --- | --- | --- |
+| `_id` | string | 安全档案 ID |
+| `profileId` | string | 对应业务档案 |
+| `profileType` | enum | `pregnancy` / `child`（02 规范名；勿使用 `domain` 作为持久化字段名） |
+| `allergyStatus` | enum | 四种过敏状态，**唯一存储归属** |
+| `declaredRestrictions` | array | 用户声明的额外限制，元素结构见 02 §7.0.3 |
+| `informationSource` | string | 信息来源（02 规范名；勿使用 `source` 作为档案级字段名） |
+| `declaredAt` | datetime | 可选，首次完成过敏信息声明时间 |
+| `version` | number | 安全档案版本 |
+| `updatedAt` | datetime | 最近更新时间 |
+| `updatedBy` | string | 修改来源 |
+
+**只读查询投影**（`derived / read-only projection`，**不得**与 `AllergyItem` / `FoodObservation` 双写）：
+
+| 投影名 | 来源实体 | 说明 |
+| --- | --- | --- |
+| `knownAllergies` | `AllergyItem`（`profileId` + 有效 `status`） | 列表/详情展示用；过滤与写入以 `allergy_items` 为准 |
+| `observations` | `FoodObservation`（`profileId`） | 列表/详情展示用；写入以 `food_observations` 为准 |
 
 过敏状态沿用：
 
@@ -280,19 +287,19 @@ GB 7718—2025 应作为预包装食品信息读取与标示规则的依据，�
 
 ### 5.3 AllergyRestriction
 
-过敏禁忌记录（**逻辑命名**；**持久化实体为 `AllergyItem`**，集合 `allergy_items`，见 02 §7.2）。
+过敏禁忌记录（**逻辑命名**；**持久化实体为 `AllergyItem`**，集合 `allergy_items`，字段与逐字段映射见 **02 §7.2**）。
 
 | 字段              | 说明                               |
 | ----------------- | ---------------------------------- |
-| restrictionId     | 禁忌记录 ID                        |
+| restrictionId     | 禁忌记录 ID（→ `AllergyItem._id`） |
 | profileId         | 对应业务档案                       |
 | foodItemId        | 对应食材                           |
-| allergenId        | 对应过敏原                         |
-| restrictionType   | 食物、食材类别或其他限制           |
-| declarationSource | 用户声明、医疗人员确认或其他来源   |
-| evidenceReference | 可选的依据引用                     |
-| status            | active / inactive / pending_review |
-| declaredAt        | 声明时间                           |
+| allergenId        | 对应过敏原（→ `AllergyItem.allergenId`，可选） |
+| restrictionType   | 食物、食材类别或其他限制（V1 食物级以 `foodItemId`/`foodName` 为主；类别级扩展见 02 映射表） |
+| declarationSource | 用户声明、医疗人员确认或其他来源（→ `AllergyItem.source`） |
+| evidenceReference | 可选的依据引用（→ `AllergyItem.evidenceReference`） |
+| status            | `active` / `inactive` / `pending_review`（→ `AllergyItem.status`） |
+| declaredAt        | 声明时间（→ `AllergyItem.createdAt`） |
 | updatedAt         | 更新时间                           |
 | notes             | 用户补充信息                       |
 

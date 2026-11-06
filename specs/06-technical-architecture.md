@@ -1244,7 +1244,20 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 4. `claimVersion = claimVersion + 1`（读-改-写须在数据库原子语义内完成）
 5. `updatedAt = serverNow`
 
-**仅当**影响记录数 = 1 时领取成功；Worker **必须**记录返回的 `claimVersion`（若平台不返回新文档，则领取后立即按 `_id` 读取 `claimVersion`，仍视为同一次成功领取的会话）。影响记录数 = 0 时 **不得**执行该 Job 的任何业务逻辑。
+**仅当**影响记录数 = 1 时领取成功；影响记录数 = 0 时 **不得**执行该 Job 的任何业务逻辑。
+
+**`claimVersion` 归属（F-04.3.3.1，禁止竞态认领）**：
+
+1. Worker **只能**使用**由本次成功原子领取操作产生**的 `claimVersion` 作为 fencing token。**禁止**将「按 `_id` 读取到的 Job 文档当前 `claimVersion`」直接当作本 Worker 的执行权版本，除非该读取同时证明文档仍归属本次领取会话（见下）。
+2. **优先**：原子领取 API **必须**在影响记录数 = 1 时返回本次写入后的 Job 快照（至少含 `claimVersion`、`leaseOwner`、`leaseExpiresAt`）。Worker **必须**自该返回值持久化 `(jobId, leaseOwner, claimVersion)`，供 §14.4.2—§14.4.5 使用。
+3. **补充读取（仅当平台无法在领取 API 返回更新后文档时）**：领取 CAS 成功且影响记录数 = 1 后，允许 **一次**按 `_id` 读取；Worker **必须**在采用读到的 `claimVersion` 前 **全部**满足：
+   - `status = processing`
+   - `leaseOwner` **等于**本 Worker 在本次原子领取 CAS 中写入的实例 ID（**不得**与领取前缓存的他人租约混淆）
+   - `leaseExpiresAt > serverNow`
+   - 读取时刻 Job 仍表现为「由本 Worker 刚完成 CAS 领取」的唯一持有者
+4. 任一条件不满足 → **视为领取未完成**，Worker **必须**放弃执行：不得写入 `ScheduleTask`、不得续期、不得完成/失败 Job；仅允许只读诊断。**禁止**通过重试读取「最新 `claimVersion`」覆盖或替换步骤 2 / 步骤 3 已合法取得的版本。
+5. **典型竞态（必须拒绝）**：Worker A CAS 领取成功但未及时获得版本 → A 租约过期 → Worker B 重新领取递增版本并写入新 `leaseOwner` → A 再按 `_id` 读取若见 `leaseOwner ≠ A`，**不得**采用该 `claimVersion`，**不得**继续业务写入（即使读到的版本号更大）。
+6. 后续续期、§14.4.4 下游写入、完成/失败/退避 **均须**使用步骤 2 或步骤 3 合法得到的 **同一份** `claimVersion`；**不得**在运行中改用 Job 上更新的版本号，直至本 Worker 确认执行权失效并退出。
 
 并发领取：多个 Worker 对同一 Job 仅 **一个** 条件更新成功。
 
@@ -1255,12 +1268,12 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 - `_id = jobId`
 - `status = processing`
 - `leaseOwner = 本 Worker ID`
-- `claimVersion = 本 Worker 持有的版本`
+- `claimVersion = §14.4.1 本次领取会话合法取得的版本`
 - `leaseExpiresAt > serverNow`（**禁止**对已过期租约续期「复活」）
 
 更新：`leaseExpiresAt = serverNow + leaseDuration`，`updatedAt = serverNow`。
 
-- 续期成功：可继续业务写入（仍须遵守 §14.4.4 每条写入前的执行权校验）。
+- 续期成功：可继续业务写入（仍须遵守 §14.4.4 **原子执行权边界**；续期本身 **不得**替代 §14.4.4 与 `ScheduleTask` 写入的原子绑定）。
 - 续期失败（影响 0）或网络结果未知：**不得**假设仍持有租约；须重新读取 Job 或再次条件校验；**立即停止**新的 `ScheduleTask` 及重校验结果写入；仅允许只读诊断。
 
 #### 14.4.3 过期回收与重新领取
@@ -1287,34 +1300,68 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 
 **与「processing → pending 退避」的区别**：可恢复失败时，**当前有效租约持有者**在 §14.4.5 中主动释放租约并置 `pending`；过期回收 **无** 有效租约，由扫描器发起。
 
-#### 14.4.4 执行权隔离与下游写入（F-04.3.3 核心）
+#### 14.4.4 执行权隔离与下游写入（F-04.3.3 / F-04.3.3.1 核心）
 
 **原则**：失去租约或 `claimVersion` 已落后的 Worker，**不得**产生任何持久化业务副作用（含 `ScheduleTask` 更新、重校验结果、`TaskActionLog` 追加等）。**禁止**「BackgroundJob 终态更新失败但 ScheduleTask 已被旧 Worker 写入」。
 
-**执行权校验（每次持久化写操作前均须满足，不得仅在任务开始或仅在 Job 完成时校验一次）**：
+**原子执行权边界（F-04.3.3.1）**：
+
+对 **每一条** 会改变 `ScheduleTask` 或重校验结论的持久化写入，**执行权校验与业务写入必须处于同一个具备并发隔离能力的原子边界内**（同一数据库事务，或经架构评审确认等价的持久化协调原子操作）。**禁止**以下做法作为「隔离」：
+
+- 事务外「先读 Job / 先条件更新 Job，再单独更新 `ScheduleTask`」的普通 check-then-write；
+- 将「同一次 Cloud Function 调用内的顺序执行」等同于跨 Worker / 跨调用的互斥锁；
+- 在 `ScheduleTask` 已写入后，指望 BackgroundJob 完成/失败 CAS 失败来「撤销」下游副作用。
+
+**本 Worker 持有的执行权前提**（与 §14.4.1 绑定，**不得**在原子边界外单独当作已生效）：
 
 | 校验项 | 要求 |
 | --- | --- |
 | Job 状态 | `status = processing` |
 | 租约归属 | `leaseOwner` = 本 Worker ID |
-| Fencing | `claimVersion` = 本 Worker 持有的版本 |
+| Fencing | `claimVersion` = §14.4.1 为**本次领取会话**合法取得、且运行中未确认失效的版本 |
 | 租约时效 | `leaseExpiresAt > serverNow` |
 
-**BackgroundJob 状态变更**（完成、失败、退避、错误信息、`retryCount`、`nextRetryAt`）：**必须**使用与 §14.4.4 相同的条件字段（`_id` + `status=processing` + `leaseOwner` + `claimVersion` + 租约未过期）。旧 Worker 延迟提交完成 **必须**因 `claimVersion` 不匹配或租约失效而拒绝（影响 0）。
+**BackgroundJob 状态变更**（完成、失败、退避、错误信息、`retryCount`、`nextRetryAt`）：**必须**使用条件字段（`_id` + `status=processing` + `leaseOwner` + `claimVersion` + 租约未过期）。旧 Worker 延迟提交 **必须**因 `claimVersion` 不匹配或租约失效而拒绝（影响 0）。**说明**：Job 终态 CAS 与 `ScheduleTask` 写入 **不是**同一原子边界时，终态 CAS 失败 **不能**修复已发生的 Task 写入；故 Task 写入 **必须先**满足下述原子机制。
 
-**ScheduleTask 重校验写入**：
+**ScheduleTask 重校验写入 — 批准机制（二选一，须先完成 ARC-05 能力验证）**：
 
-1. **首选**：在同一**数据库事务**内（平台支持时）：先对 `background_jobs` 做 §14.4.4 执行权条件更新（可为「touch `updatedAt`」或续期），再对目标 `schedule_tasks` 做条件更新（`profileId` 匹配、`status` 为未执行态如 `pending`、计划时间在未来等业务条件见 04 §9.5 / 05 §5.3.1）。任一步失败则整事务回滚。
-2. **若当前微信云开发环境无法跨集合原子事务**：**必须**采用「单条 `schedule_tasks` 条件更新 + 同一云函数调用内、写入前 **同步** 执行 BackgroundJob 执行权条件读/更新；若 Job 校验影响 0，**不得**写入该任务」。该路径在实现评审中须标记为依赖单函数串行化，并通过集成测试验证无双 Worker 副作用；规格层结论见 07 §15.8。
-3. **幂等**：同一 Job 对同一 `ScheduleTask` 的重复重校验写入须保持业务幂等（§14.4 执行范围）；执行权隔离 **补充** 幂等，**不替代** `idempotencyKey`。
+**机制 A：跨集合数据库事务（首选，待 ARC-05 验证）**
+
+在同一**已确认具备所需隔离语义**的数据库事务内 **顺序或原子提交**：
+
+1. 对 `background_jobs` 做 **执行权条件更新**（过滤：`status=processing`、`leaseOwner`、§14.4.1 绑定的 `claimVersion`、`leaseExpiresAt > serverNow`；更新可为 touch `updatedAt` 或合法续期字段）；
+2. 对目标 `schedule_tasks` 做 **业务条件更新**（`profileId` 匹配、`status` 为未执行态如 `pending`、计划时间在未来等，见 04 §9.5 / 05 §5.3.1）。
+
+**必须**满足：旧 Worker 在新 Worker 已取得执行权后，其事务 **不得**成功提交步骤 2（步骤 1 影响行数为 0 则整事务回滚，**不得**留下 Task 变更）。**不得**因平台提供 `runTransaction` 类 API 即默认满足；须在 ARC-05 中记录：隔离级别、冲突检测、跨集合支持范围、与并发 Worker 的实测结论。
+
+**机制 B：持久化执行协调原子操作（仅当 ARC-05 确认机制 A 不可用且评审批准）**
+
+须设计 **单一原子写入边界**，使「执行权 CAS」与「单条 `schedule_tasks` 条件更新」**不可被旧 Worker 在新 Worker 取得执行权后单独提交**。示例方向（实施时择一落地并回填 ADR/02 字段，**不得**静默引入未文档化字段）：
+
+- 经确认的跨文档事务 batch（与机制 A 等价）；或
+- 在 `schedule_tasks`（或专用协调集合）上增加 **与 Job 执行权绑定的镜像条件字段**，且镜像更新与 Task 业务更新 **在同一事务/同一文档原子更新**内与 `background_jobs` 执行权 CAS 联动。
+
+**未选定机制 B 具体方案前，不得**对 `ScheduleTask` 做自动化写入。
+
+**Fail-Closed（F-04.3.3.1，三种状态须区分记录）**：
+
+| 状态 | 含义 | Worker 行为 |
+| --- | --- | --- |
+| **能力尚未验证** | ARC-05 未完成；跨集合/协调机制是否满足上表 **未知** | **禁止**自动化修改 `ScheduleTask`；Job 保持 `processing` 或进入 **待人工恢复** / 显式失败路径（写入 `lastError` 须含原因码）；须告警 |
+| **能力已确认不支持** | 评审结论：当前微信云开发环境 **无法**提供合格原子边界 | 同上；不得降级为 check-then-write |
+| **能力支持但本次事务失败** | 提交冲突、超时、结果未知 | **不得**假设 Task 未写入；须按幂等与只读重查恢复；在重新确认 §14.4.1 执行权前 **不得**重复 blindly 写入 |
+
+**租约过期 / 重新领取**：新 Worker 领取后 `claimVersion` 递增；旧 Worker 任何机制 A/B 提交 **必须**在步骤 1 失败并整笔回滚。**旧 Worker 从暂停中恢复**且本地版本已失效：**必须**停止写入并退出，**不得**提交缓存的 Task 变更。
+
+**幂等**：同一 Job 对同一 `ScheduleTask` 的重复重校验写入须保持业务幂等（§14.4.6）；执行权隔离 **补充** 幂等，**不替代** `idempotencyKey`。
 
 **读操作**：扫描未来任务可为只读；**任何**改变 `ScheduleTask` 或写入重校验结论的 operation 均受本节约束。
 
 #### 14.4.5 完成、失败与重试
 
-**成功完成**：在 §14.4.4 条件满足的前提下，条件更新 Job → `completed`，写入 `completedAt`，释放租约（`leaseOwner=null`，`leaseExpiresAt=null`）；可 emit `safety_revalidation_completed`（05 事件表）。
+**成功完成**：全部目标 `ScheduleTask` 写入均已通过 §14.4.4 **机制 A/B 原子边界**（或无需写入的只读结论）后，再对 Job 做条件更新 → `completed`，写入 `completedAt`，释放租约（`leaseOwner=null`，`leaseExpiresAt=null`）；可 emit `safety_revalidation_completed`（05 事件表）。**禁止**在仍有未通过原子边界的 Task 写入计划时标记完成。
 
-**可恢复失败**：须先满足 §14.4.4，再在同一条件更新中：`retryCount` 递增，计算 `nextRetryAt`（指数退避，最大次数等见下），`status=pending`，**释放租约**。
+**可恢复失败**：在 **未** 通过 §14.4.4 原子边界写入的前提下，若仍持有有效执行权，可对 Job 做条件更新：`retryCount` 递增，计算 `nextRetryAt`（指数退避，最大次数等见下），`status=pending`，**释放租约**。若失败原因属于 §14.4.4 Fail-Closed（能力未验证/不支持/事务结果未知且无法确认 Task 状态），**不得**用普通退避替代 Fail-Closed 记录。
 
 **超过最大重试或不可恢复错误**：条件更新 → `status=failed`，写入 `lastError` / `retryCount`，释放租约；**禁止**静默删除。
 
@@ -1326,22 +1373,26 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 1. 仅重校验该 `profileId` 下 **未来尚未执行** 的 `ScheduleTask`（与 04 §9.5、05 §5.3.1 一致）。
 2. **不得**修改已完成历史 `ScheduleTask`。
 3. **不得**绕过 S1 过敏过滤（05 §5.3.2）。
-4. 执行逻辑须 **幂等**：同一 Job 重复消费不得重复错误阻断或重复写入矛盾状态（在 **当前** `claimVersion` 持有者下）。
+4. 执行逻辑须 **幂等**：同一 Job 重复消费不得重复错误阻断或重复写入矛盾状态（在 **§14.4.1 合法** `claimVersion` 持有者下，且 §14.4.4 原子边界内）。
 
 #### 14.4.7 异常场景（租约与执行权）
 
 | 场景 | 触发条件 | Job / 租约变化 | 是否允许业务写入 | 恢复 |
 | --- | --- | --- | --- | --- |
-| Worker 正常完成 | 重校验结束 | 条件 → `completed`，释放租约 | 完成前最后一批写入须 §14.4.4 | — |
+| Worker 正常完成 | 重校验结束 | 条件 → `completed`，释放租约 | 每条 Task 写入须 §14.4.4 机制 A/B | — |
 | Worker 崩溃 | 进程退出 | 租约到期后 §14.4.3 回收 | 崩溃后旧 Worker 无写入权 | 扫描回收 + 重新领取 |
 | 执行超过租约 | 未续期 | 过期后回收；或续期成功则延长 | 续期失败则停止写入 | 续期 / 回收 |
-| A 过期，B 重新领取 | `leaseExpiresAt` 到期 | B 领取 `claimVersion++` | A **禁止**；B 在 §14.4.4 下允许 | 自动 |
-| A 失租约后尝试写入 | A 版本过期或租约失效 | 无 Job 更新 | **拒绝**（影响 0） | A 应退出 |
+| A 过期，B 重新领取 | `leaseExpiresAt` 到期 | B 领取 `claimVersion++` | A **禁止**（机制 A/B 步骤 1 失败）；B 在验证 §14.4.1 版本后允许 | 自动 |
+| A 失租约后尝试写入 | A 版本过期或租约失效 | 无合法 Job 终态 | **拒绝**；Task 写入须在原子边界内失败 | A 应退出 |
+| A 暂停后恢复 | 租约已过期或被 B 领取 | B 持有新 `(leaseOwner, claimVersion)` | A **禁止**；不得用 `_id` 读取的最新版本继续写 | A 退出；B 或回收 |
+| 领取后补充读失败 | §14.4.1 步骤 3 不满足 | 不视为有效领取 | **禁止**一切业务写入 | 放弃本次执行 |
 | 两 Worker 同时领取 | 并发 CAS | 一者成功递增版本 | 失败者 **禁止** | — |
 | 两 Worker 同时回收 | 并发 CAS | 一者成功置 `pending` | 回收过程无业务写入 | — |
-| A 延迟提交完成 | B 已领取或已完成 | CAS 失败 | **拒绝** | 人工查 Job 状态 |
-| 续期结果未知 | 网络超时 | 不得假设成功 | **暂停写入**直至重新确认执行权 | 重读 Job 或重试续期 |
-| 重复处理同一 Job | 重试 / 重新领取 | 版本递增 | 仅当前版本持有者；业务幂等仍生效 | §14.4.1 / §14.4.3 |
+| A 延迟提交完成 | B 已领取或已完成 | CAS 失败 | **拒绝**（**不能**撤销已发生的 Task 写入，故 A 不应再产生 Task 写） | 人工查 Job / Task 状态 |
+| 续期结果未知 | 网络超时 | 不得假设成功 | **暂停写入**直至重新确认 §14.4.1 执行权 | 重读 Job 或重试续期 |
+| ARC-05 未验证 | 机制 A/B 未确认 | Job 可保持 `processing` 或 Fail-Closed | **禁止** Task 自动化写入 | 人工 / 能力验证后恢复 |
+| 事务提交结果未知 | 超时/网络 | 不得假设回滚或成功 | **暂停**；幂等重查 Task 与 Job 后再决策 | 运维流程 |
+| 重复处理同一 Job | 重试 / 重新领取 | 版本递增 | 仅当前 §14.4.1 合法版本持有者；业务幂等仍生效 | §14.4.1 / §14.4.3 |
 
 **系统重启**：启动时扫描 `pending` 及 **租约过期**的 `processing`（§14.4.3），**不得**仅按 `updatedAt` 阈值回收而忽略 `leaseExpiresAt`。
 
@@ -1826,7 +1877,7 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 | ARC-02 | 微信云开发具体环境及 SDK 版本           | 工程初始化     |
 | ARC-03 | 是否采用独立构建工具管理共享 package    | 工程初始化     |
 | ARC-04 | 轻量管理后台具体实现方式                | 内容中心开发   |
-| ARC-05 | 云数据库事务能力和限制                  | 日程引擎开发   |
+| ARC-05 | 云数据库事务能力和限制（**须**覆盖 §14.4.4 机制 A/B 与 08 §8.4 多文档事务；未完成前 Worker **不得**自动化写入 `ScheduleTask`） | 日程引擎开发（**阻塞**过敏解除重校验 Worker 下游写入） |
 | ARC-06 | 云函数运行时和超时限制                  | 后端实施       |
 | ARC-07 | 定时任务批处理和重试策略                | 后台任务开发   |
 | ARC-08 | 一期用户数据及内容数据规模预估          | 数据库设计     |

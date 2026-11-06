@@ -999,26 +999,58 @@ Agent 必须：
 | 独立走查 | 07 维护者/评审人重读交叉引用 |
 | 实现验证 | 代码 + 并发/故障注入测试 |
 
-复核方法：人工重读 02 §7.4.1、§12；06 §8.4.1、§14.3—§14.4.7；全文检索 `claimVersion`、`leaseOwner`、`leaseExpiresAt`；确认未将 `idempotencyKey` 当作 fencing token；执行 `git diff --check`。**未**执行代码或自动化测试。
+复核方法：人工重读 02 §7.4.1、§12；06 §8.4.1、§14.3—§14.4.7；全文检索 `claimVersion`、`leaseOwner`、`workerInstanceId`、`leaseExpiresAt`；确认未将 `idempotencyKey` 或 `workerInstanceId` 当作 fencing / Claim Session；执行 `git diff --check`。**未**执行代码或自动化测试。
 
 | 子项 | 优先级 | 修复要点 | 涉及文档 | 验证依据 | 文档修订 | 独立走查 | 实现验证 | 结论 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| F-04.3.3-01 租约字段 | P1 | `leaseOwner` / `leaseExpiresAt` / `claimVersion`；生命周期与状态机关联 | 02 §7.4.1 | 字段表 + 租约语义 9 条；`claimVersion` 唯一 fencing | 完成 | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
-| F-04.3.3-02 原子领取 | P1 | 单次 CAS + **claimVersion 与本次领取绑定**（F-04.3.3.1）；禁止裸 `_id` 认领最新版本 | 06 §14.4.1 | 补充读须校验 `leaseOwner`+租约；竞态 A/B 拒绝 | **F-04.3.3.1 完成** | **待执行** | 未执行 | **PARTIAL**（Spec 层；**独立走查未通过**，不得标 PASS） |
-| F-04.3.3-03 租约续期 | P1 | 匹配 job/owner/version + 未过期；失败停写 | 06 §14.4.2 | 续期不可复活过期租约 | 完成 | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
-| F-04.3.3-04 过期回收与重新领取 | P1 | 仅过期 `processing`；回收 CAS；重新领取递增版本 | 06 §14.4.3；02 §7.4.1 | 非仅改 status 忽略旧 Worker | 完成 | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
-| F-04.3.3-05 下游写入隔离 | P0 | **原子边界**机制 A/B；移除 check-then-write / 单函数串行降级；Fail-Closed（F-04.3.3.1） | 06 §14.4.4；ARC-05 | 旧 Worker 不得在新 Worker 领取后提交 Task 写 | **F-04.3.3.1 完成** | **待执行** | 未执行 | **PARTIAL**（Spec 层；**独立走查未通过**；ARC-05 / 实现 / 并发测试均未验证） |
-| F-04.3.3-06 完成/失败/重试校验 | P1 | 状态变更均带 owner + version + 租约；完成须在 Task 原子写入之后 | 06 §14.4.5 | 旧 Worker 延迟完成拒绝；Fail-Closed 不得普通退避 | F-04.3.3.1 完成 | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
-| F-04.3.3-07 异常场景 | P1 | §14.4.7 场景表 + §8.4.1 重启/崩溃；含领取补充读/ARC-05/事务未知 | 06 §14.4.7、§8.4.1 | 覆盖 A 暂停恢复、双领取/双回收 | F-04.3.3.1 完成 | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
+| F-04.3.3-01 租约字段 | P1 | `leaseOwner`（Claim Session ID）/ `workerInstanceId` / `leaseExpiresAt` / `claimVersion`；三者不可互相替代（F-04.3.3.1.1） | 02 §7.4.1 | 字段表 + 身份三分法 + 租约语义 9 条 | **F-04.3.3.1.1 完成** | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
+| F-04.3.3-02 原子领取 | P1 | 每次 claim 新 Claim Session ID + CAS 绑定 `claimVersion`；补充读须会话 ID + 绑定版本（F-04.3.3.1 / F-04.3.3.1.1） | 06 §14.4.1 | 禁止 workerInstanceId 作 leaseOwner；同实例 A1/A2 拒绝 | **F-04.3.3.1.1 完成** | **待执行** | 未执行 | **PARTIAL**（Spec 层；**独立走查未通过**，不得标 PASS） |
+| F-04.3.3-03 租约续期 | P1 | 匹配 job + Claim Session + version + 未过期；失败停写 | 06 §14.4.2 | 续期不可复活过期租约；不得仅用 workerInstanceId | **F-04.3.3.1.1 完成** | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
+| F-04.3.3-04 过期回收与重新领取 | P1 | 回收清空 leaseOwner/workerInstanceId；重新领取新会话 + 递增版本 | 06 §14.4.3；02 §7.4.1 | 旧会话失效与实例 ID 无关 | **F-04.3.3.1.1 完成** | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
+| F-04.3.3-05 下游写入隔离 | P0 | **原子边界**机制 A/B；执行权 CAS 用 Claim Session + version（F-04.3.3.1 / F-04.3.3.1.1） | 06 §14.4.4；ARC-05 | 旧会话不得在新会话领取后提交 Task 写 | **F-04.3.3.1.1 完成** | **待执行** | 未执行 | **PARTIAL**（Spec 层；**独立走查未通过**；ARC-05 / 实现 / 并发测试均未验证） |
+| F-04.3.3-06 完成/失败/重试校验 | P1 | 状态变更均带 Claim Session + version + 租约 | 06 §14.4.5 | 禁止绕过 fencing 重读最新 token | **F-04.3.3.1.1 完成** | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
+| F-04.3.3-07 异常场景 | P1 | §14.4.7 含同实例 A1 恢复 vs A2；补充读/ARC-05 | 06 §14.4.7、§8.4.1 | 覆盖 A 暂停恢复、双领取/双回收 | **F-04.3.3.1.1 完成** | 待执行 | 未执行 | **PARTIAL**（Spec 层） |
 
 **F-04.3.3.1 定点修复（2026-11-06，执行权原子边界 + claimVersion 领取竞态）**
 
 | 子项 | 优先级 | 修复要点 | 涉及文档 | 作者自检（F-04.3.3.1） |
 | --- | --- | --- | --- | --- |
 | P0 下游写入 | P0 | 删除 §14.4.4 不安全降级；机制 A/B + Fail-Closed 三分法 | 06 §14.4.4、§14.4.5、§14.4.7；ARC-05 | 无 check-then-write 路径 |
-| P1 claimVersion | P1 | §14.4.1 领取版本归属 + 有条件补充读 | 06 §14.4.1—§14.4.2 | 不新增 02 字段（`leaseOwner` 证明领取身份） |
+| P1 claimVersion | P1 | §14.4.1 领取版本归属 + 有条件补充读 | 06 §14.4.1—§14.4.2 | 初版误将 `leaseOwner` 等同 Worker 实例 ID；**已由 F-04.3.3.1.1 修正** |
 
-**F-04.3.3 总判定**：**PARTIAL PASS（Spec 层）** — F-04.3.3.1 **Spec 修订**已写入 06 §14.4.1 / §14.4.4 等；F-04.3.3-02、F-04.3.3-05 在 **独立走查 PASS 前不得标 PASS**；**实现验证**、**ARC-05 平台能力验证**、**并发/故障注入测试**均未执行；**不得**标为 PASS（Spec 层全绿）。
+**F-04.3.3.1.1 定点修复（2026-11-06，Claim Session ID 唯一性与领取身份隔离）**
+
+**依据**：F-04.3.3.1 独立走查 **P1** — `leaseOwner` 被定义为 Worker 实例 ID 时，同一实例重复领取会导致旧执行流程通过补充读取采用新 `claimVersion`。
+
+**修复范围**：02 §7.4.1（`leaseOwner` 语义、`workerInstanceId`、执行权三元组）；06 §14.4.1—§14.4.7（claim / renew / reclaim / 下游写入 / 终态 / 异常）；本表状态同步。
+
+**三种身份（Spec 最终口径）**：
+
+| 身份 | 存储 / 来源 | 用途 | 不得用于 |
+| --- | --- | --- | --- |
+| Worker Instance ID | `workerInstanceId`（Job 镜像，可选）+ Worker 本地 | 诊断、日志、实例追踪 | 单独证明领取或执行权 |
+| Claim Session ID | `leaseOwner` | 单次成功 claim 的唯一会话 | 与实例 ID 混用或复用 |
+| Claim Version | `claimVersion` | Job 级 fencing token，与同次 claim 绑定 | 从 `_id` 裸读「最新版本」替代本地绑定版本 |
+
+| 检查项 | 要求摘要 | 涉及文档 | 文档修订 | 独立走查 | 实现验证 | 结论 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3.1 字段三分法 | `leaseOwner`=Claim Session；独立 `workerInstanceId` | 02 §7.4.1 | 完成 | 待执行 | 未执行 | **Spec 层待走查 PASS** |
+| 3.2 每次 claim 新会话 | CAS 前生成 ID；失败无有效会话 | 06 §14.4.1 | 完成 | 待执行 | 未执行 | **Spec 层待走查 PASS** |
+| 3.3 补充读校验 | `_id`+status+**会话 ID**+**绑定 version**+租约+原子成功 | 06 §14.4.1 | 完成 | 待执行 | 未执行 | **Spec 层待走查 PASS** |
+| 3.4 全流程 fencing | renew/reclaim/下游/终态/重试均 Claim Session + version | 06 §14.4.2—§14.4.5、§14.4.7 | 完成 | 待执行 | 未执行 | **Spec 层待走查 PASS** |
+| 3.5 同实例 A1/A2 场景 | §14.4.1 步骤 7 + §14.4.7 场景行 | 06 §14.4.1、§14.4.7 | 完成 | 待执行 | 未执行 | **Spec 层待走查 PASS** |
+| 3.6 02/06 同步 | 索引说明与租约清理含 `workerInstanceId` | 02 §12；06 §14.3 | 完成 | 待执行 | — | **Spec 层待走查 PASS** |
+
+**作者自检（F-04.3.3.1.1）**：上述 3.1—3.6 文档修订 **完成**；**独立走查未执行** — Claim Session ID Spec 定义 **不得**在本轮作者自检后直接标 **PASS（Spec 层）**，须评审人重读后确认。
+
+**尚未验证（不得因 Spec 完善而标 PASS）**：
+
+- 微信云开发事务能力 **ARC-05**（含 §14.4.4 机制 A/B）
+- Worker **原子 claim** 的实际实现（Claim Session ID 生成与 CAS 字段写入）
+- Worker **并发**测试（双 Worker / 双会话领取）
+- **旧执行流程恢复**故障注入（同实例 A1 暂停 → A2 领取 → A1 恢复）
+
+**F-04.3.3 总判定**：**PARTIAL PASS（Spec 层）** — F-04.3.3.1 / F-04.3.3.1.1 **Spec 修订**已写入 02 §7.4.1 与 06 §14.4；F-04.3.3-02、F-04.3.3-05 在 **独立走查 PASS 前不得标 PASS**；**实现验证**、**ARC-05**、**并发/故障注入测试**均未执行；**不得**标为 PASS（Spec 层全绿）。
 
 **与 F-04.3.2-02 关系**：F-04.3.3.1 关闭 Spec 层 P0/P1 表述缺口后，F-04.3.2-02 仍保持 **PARTIAL**，直至独立走查确认 02 §7.4.1 与 06 §14.4 无冲突、ARC-05 完成且实现路径通过评审。
 

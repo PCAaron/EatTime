@@ -1199,7 +1199,7 @@ BackgroundJob
   - retryCount / attempts
   - nextRetryAt
   - lastError / lastErrorCode
-  - leaseOwner / leaseExpiresAt / claimVersion（执行租约与 fencing token，02 §7.4.1、§14.4）
+  - leaseOwner（Claim Session ID）/ workerInstanceId（诊断）/ leaseExpiresAt / claimVersion（fencing token，02 §7.4.1、§14.4）
   - createdAt
   - updatedAt
   - completedAt
@@ -1229,6 +1229,8 @@ BackgroundJob
 
 #### 14.4.1 原子领取（Claim）
 
+**领取会话（F-04.3.3.1.1）**：每次发起新的 claim 尝试，Worker **必须**先生成新的 **Claim Session ID**（全局唯一、不可复用；**禁止**直接使用稳定的 Worker 运行实例 ID 作为 Claim Session ID）。**仅当**后续单次条件更新影响记录数 = 1 时，该 ID 才成为本次有效领取会话，并与本次原子递增得到的 `claimVersion` **绑定**；CAS 失败、影响 0 或无法确认原子成功的请求 **不得**将已生成的 ID 当作有效执行身份。
+
 Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update」。领取 **必须**为**单次条件更新**（Compare-And-Set），过滤条件 **同时**包含：
 
 1. `_id = jobId`
@@ -1239,25 +1241,32 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 更新字段 **在同一原子操作中**：
 
 1. `status = processing`
-2. `leaseOwner = <本 Worker 实例唯一 ID>`
-3. `leaseExpiresAt = serverNow + leaseDuration`
-4. `claimVersion = claimVersion + 1`（读-改-写须在数据库原子语义内完成）
-5. `updatedAt = serverNow`
+2. `leaseOwner = <本次 claim 在 CAS 前已生成的 Claim Session ID>`
+3. `workerInstanceId = <本 Worker 运行实例 ID>`（可选写入，**仅**诊断；**不得**替代步骤 2）
+4. `leaseExpiresAt = serverNow + leaseDuration`
+5. `claimVersion = claimVersion + 1`（读-改-写须在数据库原子语义内完成）
+6. `updatedAt = serverNow`
 
-**仅当**影响记录数 = 1 时领取成功；影响记录数 = 0 时 **不得**执行该 Job 的任何业务逻辑。
+**仅当**影响记录数 = 1 时领取成功；影响记录数 = 0 时 **不得**执行该 Job 的任何业务逻辑，且 **不得**将本次预生成的 Claim Session ID 用于续期或下游写入。
 
-**`claimVersion` 归属（F-04.3.3.1，禁止竞态认领）**：
+**同一 Worker 运行实例再次领取同一 Job**：**必须**生成 **新的** Claim Session ID（与上次不同），走完整 §14.4.1；**不得**沿用旧会话 ID。**旧执行流程**恢复时 **必须**仍持有其**原始** `(claimSessionId, claimVersion)`，**禁止**读取 Job 当前 `leaseOwner` / `claimVersion` 并替换本地会话。
 
-1. Worker **只能**使用**由本次成功原子领取操作产生**的 `claimVersion` 作为 fencing token。**禁止**将「按 `_id` 读取到的 Job 文档当前 `claimVersion`」直接当作本 Worker 的执行权版本，除非该读取同时证明文档仍归属本次领取会话（见下）。
-2. **优先**：原子领取 API **必须**在影响记录数 = 1 时返回本次写入后的 Job 快照（至少含 `claimVersion`、`leaseOwner`、`leaseExpiresAt`）。Worker **必须**自该返回值持久化 `(jobId, leaseOwner, claimVersion)`，供 §14.4.2—§14.4.5 使用。
-3. **补充读取（仅当平台无法在领取 API 返回更新后文档时）**：领取 CAS 成功且影响记录数 = 1 后，允许 **一次**按 `_id` 读取；Worker **必须**在采用读到的 `claimVersion` 前 **全部**满足：
+**`claimVersion` 与 Claim Session 归属（F-04.3.3.1 / F-04.3.3.1.1，禁止竞态认领）**：
+
+1. Worker **只能**使用**由本次成功原子领取操作产生并绑定**的 `(claimSessionId, claimVersion)` 作为执行权。**禁止**将「按 `_id` 读取到的 Job 文档当前 `claimVersion`」直接当作本执行流程的 fencing token，除非该读取 **同时**证明文档仍归属**本次**领取会话（见下）。
+2. **优先**：原子领取 API **必须**在影响记录数 = 1 时返回本次写入后的 Job 快照（至少含 `claimVersion`、`leaseOwner`、`leaseExpiresAt`；可含 `workerInstanceId`）。Worker **必须**自该返回值持久化 `(jobId, claimSessionId, claimVersion)`（`claimSessionId` = 返回值 `leaseOwner`），供 §14.4.2—§14.4.5 使用。
+3. **补充读取（仅当平台无法在领取 API 返回更新后文档时）**：在 **已确认** CAS 成功且影响记录数 = 1 后，允许 **一次**按 `_id` 读取；Worker **必须**在采用读到的字段前 **全部**满足：
+   - `_id` 与本次领取目标 Job 一致
    - `status = processing`
-   - `leaseOwner` **等于**本 Worker 在本次原子领取 CAS 中写入的实例 ID（**不得**与领取前缓存的他人租约混淆）
+   - `leaseOwner` **等于**本次 claim **在 CAS 中写入的 Claim Session ID**（与 Worker 本地 `claimSessionId` 一致；**不得**与 `workerInstanceId` 混用）
+   - `claimVersion` **等于**本次成功 claim **已绑定**的版本（来自 CAS 返回值、或平台在 CAS 成功时给出的递增结果）；**禁止**因读到的版本号更大而采用 Job 上最新 `claimVersion`
    - `leaseExpiresAt > serverNow`
-   - 读取时刻 Job 仍表现为「由本 Worker 刚完成 CAS 领取」的唯一持有者
-4. 任一条件不满足 → **视为领取未完成**，Worker **必须**放弃执行：不得写入 `ScheduleTask`、不得续期、不得完成/失败 Job；仅允许只读诊断。**禁止**通过重试读取「最新 `claimVersion`」覆盖或替换步骤 2 / 步骤 3 已合法取得的版本。
-5. **典型竞态（必须拒绝）**：Worker A CAS 领取成功但未及时获得版本 → A 租约过期 → Worker B 重新领取递增版本并写入新 `leaseOwner` → A 再按 `_id` 读取若见 `leaseOwner ≠ A`，**不得**采用该 `claimVersion`，**不得**继续业务写入（即使读到的版本号更大）。
-6. 后续续期、§14.4.4 下游写入、完成/失败/退避 **均须**使用步骤 2 或步骤 3 合法得到的 **同一份** `claimVersion`；**不得**在运行中改用 Job 上更新的版本号，直至本 Worker 确认执行权失效并退出。
+   - 本次 claim 已确认原子成功（影响记录数 = 1）
+4. **不充分条件（必须拒绝）**：仅 `_id` 相同、`status = processing`、`leaseOwner` 等于 Worker 运行实例 ID、租约仍有效 — **不足以**证明属于本次领取会话；**不得**继续业务写入。
+5. 任一条件不满足 → **视为领取未完成**，Worker **必须**放弃执行：不得写入 `ScheduleTask`、不得续期、不得完成/失败 Job；仅允许只读诊断。**禁止**通过重试读取「最新 `claimVersion`」或「最新 `leaseOwner`」覆盖或替换步骤 2 / 步骤 3 已合法取得的会话三元组。
+6. **典型竞态（必须拒绝）**：Worker A 会话 A1 CAS 成功但未及时获得版本 → A1 租约过期 → Worker B 会话 B1 重新领取递增版本并写入新 `leaseOwner` → A1 再按 `_id` 读取若见 `leaseOwner ≠ A1` 或 `claimVersion` 与 A1 绑定版本不一致，**不得**采用读到的值，**不得**继续业务写入。
+7. **同实例双会话（F-04.3.3.1.1，必须拒绝）**：Worker 运行实例 A 会话 A1 领取 `claimVersion = 1` 后暂停 → 租约过期回收 → **同一**运行实例 A 会话 A2 领取 `claimVersion = 2` → A1 恢复后 **不得**因 `workerInstanceId` 相同而通过校验；A1 的续租、下游写入、完成/失败 **必须**失败；A2 在合法会话 + 版本下方可执行。
+8. 后续续期、§14.4.4 下游写入、完成/失败/退避 **均须**使用步骤 2 或步骤 3 合法得到的 **同一份** `(claimSessionId, claimVersion)`；**不得**在运行中改用 Job 上更新的会话或版本号，直至本执行流程确认执行权失效并退出。
 
 并发领取：多个 Worker 对同一 Job 仅 **一个** 条件更新成功。
 
@@ -1267,14 +1276,14 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 
 - `_id = jobId`
 - `status = processing`
-- `leaseOwner = 本 Worker ID`
+- `leaseOwner = §14.4.1 本次领取会话的 Claim Session ID`（**不得**仅用 `workerInstanceId`）
 - `claimVersion = §14.4.1 本次领取会话合法取得的版本`
 - `leaseExpiresAt > serverNow`（**禁止**对已过期租约续期「复活」）
 
-更新：`leaseExpiresAt = serverNow + leaseDuration`，`updatedAt = serverNow`。
+更新：`leaseExpiresAt = serverNow + leaseDuration`，`updatedAt = serverNow`（**不得**变更 `leaseOwner` / `claimVersion`）。
 
 - 续期成功：可继续业务写入（仍须遵守 §14.4.4 **原子执行权边界**；续期本身 **不得**替代 §14.4.4 与 `ScheduleTask` 写入的原子绑定）。
-- 续期失败（影响 0）或网络结果未知：**不得**假设仍持有租约；须重新读取 Job 或再次条件校验；**立即停止**新的 `ScheduleTask` 及重校验结果写入；仅允许只读诊断。
+- 续期失败（影响 0）或网络结果未知：**不得**假设仍持有租约；须重新读取 Job 或再次条件校验（仍须匹配 **本地** Claim Session + `claimVersion`）；**立即停止**新的 `ScheduleTask` 及重校验结果写入；仅允许只读诊断。
 
 #### 14.4.3 过期回收与重新领取
 
@@ -1288,13 +1297,13 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 更新：
 
 - `status = pending`（若同时触发重试退避，可写 `nextRetryAt` 且保持 `pending`）
-- `leaseOwner = null`，`leaseExpiresAt = null`
+- `leaseOwner = null`，`workerInstanceId = null`，`leaseExpiresAt = null`
 - 按策略 `retryCount` 递增或仅 `updatedAt` 更新（**不得**在此步写 `completed` / `failed` 业务结论）
 - **不修改** `claimVersion`（旧 Worker 仍可能持有旧版本号，但 Job 已非其租约下的 `processing` 且版本将在下次领取时被递增淘汰）
 
 **仅当**影响记录数 = 1 时回收成功；多回收 Worker 并发时只有一个成功。
 
-**重新领取**：回收后的 Job 走 §14.4.1 领取流程，**必须**再次递增 `claimVersion` 并写入新 `leaseOwner` / `leaseExpiresAt`。旧 Worker 持有的 `(leaseOwner, claimVersion)` **立即**失去对 Job 状态与下游写入的有效性。
+**重新领取**：回收后的 Job 走 §14.4.1 领取流程，**必须**再次递增 `claimVersion`、生成 **新** Claim Session ID 并写入 `leaseOwner` / `leaseExpiresAt`。旧领取会话持有的 `(claimSessionId, claimVersion)` **立即**失去对 Job 状态与下游写入的有效性（**与**旧会话是否来自同一 `workerInstanceId` **无关**）。
 
 **禁止**：在未递增 `claimVersion`、未设置新租约的情况下，允许第二个 Worker 并行执行同一 Job 的业务副作用。
 
@@ -1317,11 +1326,12 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 | 校验项 | 要求 |
 | --- | --- |
 | Job 状态 | `status = processing` |
-| 租约归属 | `leaseOwner` = 本 Worker ID |
-| Fencing | `claimVersion` = §14.4.1 为**本次领取会话**合法取得、且运行中未确认失效的版本 |
+| 领取会话 | `leaseOwner` = §14.4.1 **本次**合法取得的 Claim Session ID |
+| Fencing | `claimVersion` = 与上述 Claim Session **同一次**成功 claim 绑定的版本 |
 | 租约时效 | `leaseExpiresAt > serverNow` |
+| 诊断（非充分） | `workerInstanceId` 可与本地实例一致，**不得**单独替代上三项 |
 
-**BackgroundJob 状态变更**（完成、失败、退避、错误信息、`retryCount`、`nextRetryAt`）：**必须**使用条件字段（`_id` + `status=processing` + `leaseOwner` + `claimVersion` + 租约未过期）。旧 Worker 延迟提交 **必须**因 `claimVersion` 不匹配或租约失效而拒绝（影响 0）。**说明**：Job 终态 CAS 与 `ScheduleTask` 写入 **不是**同一原子边界时，终态 CAS 失败 **不能**修复已发生的 Task 写入；故 Task 写入 **必须先**满足下述原子机制。
+**BackgroundJob 状态变更**（完成、失败、退避、错误信息、`retryCount`、`nextRetryAt`）：**必须**使用条件字段（`_id` + `status=processing` + `leaseOwner`（Claim Session ID）+ `claimVersion` + 租约未过期）。旧领取会话延迟提交 **必须**因 Claim Session 不匹配、`claimVersion` 不匹配或租约失效而拒绝（影响 0）。**禁止**通过更新审计日志、重读 Job 最新 token 等方式绕过 fencing。**说明**：Job 终态 CAS 与 `ScheduleTask` 写入 **不是**同一原子边界时，终态 CAS 失败 **不能**修复已发生的 Task 写入；故 Task 写入 **必须先**满足下述原子机制。
 
 **ScheduleTask 重校验写入 — 批准机制（二选一，须先完成 ARC-05 能力验证）**：
 
@@ -1329,7 +1339,7 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 
 在同一**已确认具备所需隔离语义**的数据库事务内 **顺序或原子提交**：
 
-1. 对 `background_jobs` 做 **执行权条件更新**（过滤：`status=processing`、`leaseOwner`、§14.4.1 绑定的 `claimVersion`、`leaseExpiresAt > serverNow`；更新可为 touch `updatedAt` 或合法续期字段）；
+1. 对 `background_jobs` 做 **执行权条件更新**（过滤：`status=processing`、`leaseOwner`（Claim Session ID）、§14.4.1 绑定的 `claimVersion`、`leaseExpiresAt > serverNow`；更新可为 touch `updatedAt` 或合法续期字段）；
 2. 对目标 `schedule_tasks` 做 **业务条件更新**（`profileId` 匹配、`status` 为未执行态如 `pending`、计划时间在未来等，见 04 §9.5 / 05 §5.3.1）。
 
 **必须**满足：旧 Worker 在新 Worker 已取得执行权后，其事务 **不得**成功提交步骤 2（步骤 1 影响行数为 0 则整事务回滚，**不得**留下 Task 变更）。**不得**因平台提供 `runTransaction` 类 API 即默认满足；须在 ARC-05 中记录：隔离级别、冲突检测、跨集合支持范围、与并发 Worker 的实测结论。
@@ -1351,7 +1361,7 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 | **能力已确认不支持** | 评审结论：当前微信云开发环境 **无法**提供合格原子边界 | 同上；不得降级为 check-then-write |
 | **能力支持但本次事务失败** | 提交冲突、超时、结果未知 | **不得**假设 Task 未写入；须按幂等与只读重查恢复；在重新确认 §14.4.1 执行权前 **不得**重复 blindly 写入 |
 
-**租约过期 / 重新领取**：新 Worker 领取后 `claimVersion` 递增；旧 Worker 任何机制 A/B 提交 **必须**在步骤 1 失败并整笔回滚。**旧 Worker 从暂停中恢复**且本地版本已失效：**必须**停止写入并退出，**不得**提交缓存的 Task 变更。
+**租约过期 / 重新领取**：新领取会话取得执行权后 `claimVersion` 递增；旧领取会话任何机制 A/B 提交 **必须**在步骤 1 失败并整笔回滚。**旧执行流程从暂停中恢复**且本地 `(claimSessionId, claimVersion)` 已失效：**必须**停止写入并退出，**不得**提交缓存的 Task 变更，**不得**用 Job 上最新会话/版本续命。
 
 **幂等**：同一 Job 对同一 `ScheduleTask` 的重复重校验写入须保持业务幂等（§14.4.6）；执行权隔离 **补充** 幂等，**不替代** `idempotencyKey`。
 
@@ -1359,7 +1369,7 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 
 #### 14.4.5 完成、失败与重试
 
-**成功完成**：全部目标 `ScheduleTask` 写入均已通过 §14.4.4 **机制 A/B 原子边界**（或无需写入的只读结论）后，再对 Job 做条件更新 → `completed`，写入 `completedAt`，释放租约（`leaseOwner=null`，`leaseExpiresAt=null`）；可 emit `safety_revalidation_completed`（05 事件表）。**禁止**在仍有未通过原子边界的 Task 写入计划时标记完成。
+**成功完成**：全部目标 `ScheduleTask` 写入均已通过 §14.4.4 **机制 A/B 原子边界**（或无需写入的只读结论）后，再对 Job 做条件更新 → `completed`，写入 `completedAt`，释放租约（`leaseOwner=null`，`workerInstanceId=null`，`leaseExpiresAt=null`）；可 emit `safety_revalidation_completed`（05 事件表）。**禁止**在仍有未通过原子边界的 Task 写入计划时标记完成。
 
 **可恢复失败**：在 **未** 通过 §14.4.4 原子边界写入的前提下，若仍持有有效执行权，可对 Job 做条件更新：`retryCount` 递增，计算 `nextRetryAt`（指数退避，最大次数等见下），`status=pending`，**释放租约**。若失败原因属于 §14.4.4 Fail-Closed（能力未验证/不支持/事务结果未知且无法确认 Task 状态），**不得**用普通退避替代 Fail-Closed 记录。
 
@@ -1384,7 +1394,8 @@ Worker（`scheduler` 或 `safety`）**禁止**「先读 Job 再无条件 update�
 | 执行超过租约 | 未续期 | 过期后回收；或续期成功则延长 | 续期失败则停止写入 | 续期 / 回收 |
 | A 过期，B 重新领取 | `leaseExpiresAt` 到期 | B 领取 `claimVersion++` | A **禁止**（机制 A/B 步骤 1 失败）；B 在验证 §14.4.1 版本后允许 | 自动 |
 | A 失租约后尝试写入 | A 版本过期或租约失效 | 无合法 Job 终态 | **拒绝**；Task 写入须在原子边界内失败 | A 应退出 |
-| A 暂停后恢复 | 租约已过期或被 B 领取 | B 持有新 `(leaseOwner, claimVersion)` | A **禁止**；不得用 `_id` 读取的最新版本继续写 | A 退出；B 或回收 |
+| A 暂停后恢复 | 租约已过期或被新领取会话取代 | 新会话持有新 `(leaseOwner, claimVersion)` | 旧会话 **禁止**；不得用 `_id` 读取的最新会话/版本继续写；**不得**因同一 `workerInstanceId` 放行 | 旧会话退出；新会话或回收 |
+| 同实例 A1 暂停后 A2 领取（F-04.3.3.1.1） | 实例 A 会话 A1 租约过期；A 会话 A2 领取 `claimVersion++` | Job 上 `leaseOwner`=A2；A1 本地仍为 A1 | A1 **禁止**（会话/版本不匹配）；A2 在 §14.4.1 合法三元组下允许 | A1 退出 |
 | 领取后补充读失败 | §14.4.1 步骤 3 不满足 | 不视为有效领取 | **禁止**一切业务写入 | 放弃本次执行 |
 | 两 Worker 同时领取 | 并发 CAS | 一者成功递增版本 | 失败者 **禁止** | — |
 | 两 Worker 同时回收 | 并发 CAS | 一者成功置 `pending` | 回收过程无业务写入 | — |

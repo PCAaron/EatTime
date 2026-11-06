@@ -1101,24 +1101,33 @@ Recipe 食谱
 | `retryCount` | number | 是 | 已执行尝试次数（含失败）；初始 `0` |
 | `nextRetryAt` | datetime | 否 | 下次可领取时间；`failed` 终态后可为空 |
 | `lastError` | string | 否 | 最近一次失败摘要（非敏感） |
-| `leaseOwner` | string \| null | 是 | 当前持有执行租约的 Worker 唯一标识；未被领取或租约已释放时为 `null` |
+| `leaseOwner` | string \| null | 是 | **Claim Session ID**（单次成功领取所对应的唯一领取会话 ID，F-04.3.3.1.1）；与 Worker 运行实例 ID **不是**同一概念；未被领取或租约已释放时为 `null` |
+| `workerInstanceId` | string \| null | 否 | 当前 `processing` 租约关联的 **Worker 运行实例**标识（诊断、日志、运行实例追踪）；**不得**单独作为某次领取身份或执行权证明；租约释放时须置 `null` |
 | `leaseExpiresAt` | datetime \| null | 是 | 当前租约到期时间（**服务端时钟**为权威）；无有效租约时为 `null` |
-| `claimVersion` | number | 是 | 执行权版本号（**唯一 fencing token**）；单调递增；每次**成功领取或重新领取**时 +1 |
+| `claimVersion` | number | 是 | 该 Job 的领取版本号（**fencing token**，与 Claim Session 绑定）；单调递增；每次**成功领取或重新领取**时在原子 claim 内 +1；**不得**与 `idempotencyKey` 混用 |
 | `createdAt` | datetime | 是 | 创建时间（与成功解除同事务） |
 | `updatedAt` | datetime | 是 | 更新时间 |
 | `completedAt` | datetime | 否 | 重校验流程成功结束时间 |
 
-**租约字段语义（F-04.3.3）**：
+**租约字段语义（F-04.3.3 / F-04.3.3.1.1）**：
 
-1. **`claimVersion` 与 `idempotencyKey` / `operationId` 分工**：`idempotencyKey` 保证 Outbox **至多一条** Job；`operationId` 关联解除审计；**不得**将二者当作 Worker 执行权或租约。`claimVersion` **仅**用于 Worker 并发下的执行权隔离（fencing token），与业务幂等键无关。
-2. **初始化**：Outbox 同事务创建 Job 时，`status=pending`，`leaseOwner=null`，`leaseExpiresAt=null`，`claimVersion=0`（表示尚未有过成功领取）。
-3. **成功领取 / 重新领取**（须与 06 §14.4 原子条件更新一致）：在**同一**条件更新中 `claimVersion` 递增 1，写入当前 Worker 的 `leaseOwner`，设置 `leaseExpiresAt = serverNow + leaseDuration`（`leaseDuration` 为可配置参数，见 06 §14.4），`status=processing`。Worker 本地 **必须**持久持有三元组 `(jobId, leaseOwner, claimVersion)` 直至释放或确认失效。
-4. **租约续期**：在保持 `status=processing`、`leaseOwner` 与 `claimVersion` 不变的前提下，仅更新 `leaseExpiresAt`（须条件匹配当前 Worker 与版本，见 06 §14.4）。
-5. **过期回收**：当 `status=processing` 且 `leaseExpiresAt <= serverNow` 时，回收 Worker 可将 Job 置回可领取状态：`status=pending`（或 `pending` + `nextRetryAt`，若同时计入重试退避），`leaseOwner=null`，`leaseExpiresAt=null`；**不得**在回收时递减或重置 `claimVersion`（下一成功领取再递增，使旧 Worker 持有的版本号永久失效）。
-6. **完成（`completed`）**：条件更新成功后，`leaseOwner=null`，`leaseExpiresAt=null`；`claimVersion` **保留**最终值供审计，不再用于写入。
+**三种身份（不可互相替代）**：
+
+| 概念 | 字段 / 来源 | 含义 |
+| --- | --- | --- |
+| Worker 运行实例 | `workerInstanceId`（Job 上可选镜像 + Worker 本地） | 标识**哪台/哪个进程**在跑；同一实例可多次领取同一 Job；**仅**诊断与追踪 |
+| 领取会话 | `leaseOwner`（Claim Session ID） | 标识**哪一次成功 claim**；每次成功领取 **必须**生成新的、不可复用的 ID；**不得**用稳定的 `workerInstanceId` 填充 |
+| 领取版本 | `claimVersion` | 该 Job 的 fencing token；与**当次** Claim Session 在原子 claim 内绑定；旧会话不得采用新会话的版本 |
+
+1. **`claimVersion` 与 `idempotencyKey` / `operationId` 分工**：`idempotencyKey` 保证 Outbox **至多一条** Job；`operationId` 关联解除审计；**不得**将二者当作 Worker 执行权或租约。执行权校验 **必须**同时使用 Claim Session ID（`leaseOwner`）与 `claimVersion`；**不得**仅校验 `workerInstanceId`。
+2. **初始化**：Outbox 同事务创建 Job 时，`status=pending`，`leaseOwner=null`，`workerInstanceId=null`，`leaseExpiresAt=null`，`claimVersion=0`（表示尚未有过成功领取）。
+3. **成功领取 / 重新领取**（须与 06 §14.4 原子条件更新一致）：发起 claim **前**在 Worker 侧生成新的 Claim Session ID；**仅当**原子条件更新影响记录数 = 1 时，该 ID 才成为有效领取会话。在**同一**条件更新中：`claimVersion` 递增 1，写入本次 Claim Session ID 至 `leaseOwner`，可选写入当前 `workerInstanceId`（**不得**将 `workerInstanceId` 当作 `leaseOwner`），设置 `leaseExpiresAt = serverNow + leaseDuration`（见 06 §14.4），`status=processing`。Worker 本地 **必须**持久持有执行权三元组 `(jobId, claimSessionId, claimVersion)`（其中 `claimSessionId` 与 Job 上 `leaseOwner` 一致）直至释放或确认失效；**禁止**在暂停恢复时用 Job 上最新的 `leaseOwner` / `claimVersion` 覆盖本地会话三元组。
+4. **租约续期**：在保持 `status=processing`、`leaseOwner`（Claim Session ID）与 `claimVersion` 不变的前提下，仅更新 `leaseExpiresAt`（须条件匹配**本次领取会话**与版本，见 06 §14.4）。
+5. **过期回收**：当 `status=processing` 且 `leaseExpiresAt <= serverNow` 时，回收 Worker 可将 Job 置回可领取状态：`status=pending`（或 `pending` + `nextRetryAt`，若同时计入重试退避），`leaseOwner=null`，`workerInstanceId=null`，`leaseExpiresAt=null`；**不得**在回收时递减或重置 `claimVersion`（下一成功领取再递增，使旧领取会话持有的 `(leaseOwner, claimVersion)` 永久失效）。
+6. **完成（`completed`）**：条件更新成功后，`leaseOwner=null`，`workerInstanceId=null`，`leaseExpiresAt=null`；`claimVersion` **保留**最终值供审计，不再用于写入。
 7. **失败终态（`failed`）**：同上清理租约字段；保留 `claimVersion` 终值。
-8. **可恢复失败退避（`processing` → `pending`）**：须在仍持有有效租约时由当前 Worker 发起；释放租约（`leaseOwner=null`，`leaseExpiresAt=null`）并写入 `nextRetryAt`；**不得**在未验证租约的情况下回退状态。
-9. **人工恢复**（06 §14.4）：将 `failed` 置 `pending` 时，须清空租约字段；若 Job 曾处于 `processing` 僵死态，须先按过期回收规则释放再置 `pending`；`claimVersion` 不在人工恢复时重置（下次领取继续递增）。
+8. **可恢复失败退避（`processing` → `pending`）**：须在仍持有**本次 Claim Session** 有效租约时由当前执行流程发起；释放租约（`leaseOwner=null`，`workerInstanceId=null`，`leaseExpiresAt=null`）并写入 `nextRetryAt`；**不得**在未验证 Claim Session + `claimVersion` 的情况下回退状态。
+9. **人工恢复**（06 §14.4）：将 `failed` 置 `pending` 时，须清空租约字段（含 `workerInstanceId`）；若 Job 曾处于 `processing` 僵死态，须先按过期回收规则释放再置 `pending`；`claimVersion` 不在人工恢复时重置（下次领取继续递增并生成**新** Claim Session ID）。
 
 **状态转换（本 Job 类型）**：
 
@@ -1415,7 +1424,7 @@ Recipe 食谱
 | background_jobs     | 按幂等键去重         | **唯一索引** `idempotencyKey`（至少覆盖 `allergy_item_deactivated_schedule_revalidation`） |
 | background_jobs     | Worker 领取待执行    | `status + nextRetryAt`（或 `jobType + status + nextRetryAt`） |
 | background_jobs     | 过期租约回收扫描     | `status + leaseExpiresAt`（`status=processing` 且租约已到期） |
-| background_jobs     | 租约续期 / 执行权校验 | `_id`（主键条件更新；与 `leaseOwner`、`claimVersion` 组合校验） |
+| background_jobs     | 租约续期 / 执行权校验 | `_id`（主键条件更新；与 `leaseOwner`（Claim Session ID）、`claimVersion` 组合校验；**不得**仅用 `workerInstanceId`） |
 | safety_rules       | 查询有效安全规则     | `reviewStatus + effectiveAt`    |
 | content_versions   | 查询内容版本         | `contentId + version`           |
 | business_events    | 按档案及时间统计     | `profileId + occurredAt`        |

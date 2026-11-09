@@ -177,32 +177,54 @@ await db.runTransaction(async (tx) => {
 | 场景 | 描述 | 实验 |
 | --- | --- | --- |
 | A | 双 Worker 并发 Claim 同一 Job | EXP-01 |
-| B | 同实例 A1 → 过期 → A2 新 Session | EXP-02 |
-| C | 过期租约 Reclaim + B 新 Session / 更高 version | EXP-03 |
+| B | 同实例 / 不同 Session 的身份隔离（**不**含 Reclaim 主路径） | EXP-02 |
+| C | 过期租约 Reclaim、并发回收、重新 Claim（**不**重复 EXP-02 会话三元组场景） | EXP-03 |
 
-**原子条件（须由实验最终状态验证）**：状态允许领取、租约空或过期、新 Session ID、version 绑定、字段同事务/同 CAS 更新。
+**原子条件（须由实验最终状态验证）**：与 02 §7.4.1、06 §14.4.1 一致（见 EXP-01 条件字段清单）；新 Session ID 在 CAS **前**生成；`claimVersion` 仅在原子更新内递增；影响记录数 = 1 方视为成功。
 
 **通过标准**：任一时刻不存在两个有效 `(leaseOwner, claimVersion)` 执行权对同一 Job 生效。
 
 ### 7.3 ARC-05.3 — Fencing 与过期 Worker 防护
 
-**须验证**：旧 Session 不得 Renew / Reclaim / 写 Task / Complete / Fail / Retry；不得通过读 Job 刷新 token；同 `workerInstanceId` 下 A1≠A2。
+**须验证**（与 EXP-02 / EXP-03 分工见 §8.2）：
 
-**实验**：EXP-02、EXP-03、EXP-04（操作矩阵扩展至 §7.3 列表）。
+- 旧 Session 在失效后不得 Renew、不得写 Task、不得 Complete / Fail / Retry（Reclaim **权限**属于回收 Worker，不属于失效旧 Session）；
+- 不得通过读 Job 刷新本地 `(claimSessionId, claimVersion)`；
+- 旧 Worker 暂停恢复场景下的下游写入拒绝（EXP-04、EXP-05）。
 
-**凭证规则**：校验必须同时使用 **Claim Session ID + `claimVersion`**（不可拆）。
+**实验**：EXP-04（可控时序 + 屏障）、EXP-05（事务阶段竞争矩阵 T1—T6）；EXP-02 仅覆盖「会话身份」侧 fencing，EXP-03 仅覆盖「租约生命周期」侧 fencing。
+
+**凭证规则**：校验必须同时使用 **Claim Session ID + `claimVersion`**（不可拆）；`workerInstanceId` 不作为执行权依据。
+
+### 7.5 实验时间源与租约边界（P1-01）
+
+Spec 中租约比较以 **`serverNow`（服务端时钟为权威）** 为准（02 §7.4.1 `leaseExpiresAt` 说明；06 §14.4 过滤条件）。ARC-05 **不得**默认「云函数 `Date.now()` = 数据库服务端时间」。
+
+| 项 | 任务书口径 | 证据责任 |
+| --- | --- | --- |
+| `serverNow` 定义 | 实验与 Worker 伪代码中的 `serverNow`：指 **判定租约是否过期、Claim/Reclaim 条件、机制 A 步骤 1 过滤** 所采用的**同一时间基准**；生产目标为与持久化 `leaseExpiresAt` 写入时一致的权威时钟 | EXP-01、EXP-03、EXP-05 每组须记录采用的 `serverNow` 来源 |
+| 已确认能力（桌面调研） | 云函数内 `db.serverDate()` 可用于 **写入** `updatedAt` / `leaseExpiresAt`（见 06 示例与微信更新指引） | 实验日志须记录 `serverDate` 写入值与读回值 |
+| **待验证**能力 | 微信云开发是否提供与 CAS/事务一致的 **可读服务端时间 API**，供应用层在 Claim 条件中比较 `nextRetryAt`、`leaseExpiresAt`，且与 `serverDate` 写入语义一致 | **若无**：记入能力缺口 + 设计 EXP-01 附加用例（双 Worker 时钟偏差注入）；**不得**因未实测而标 PASS |
+| 仅云函数本地时钟时 | 若条件 CAS 只能使用云函数 `new Date()` 与库内已存 datetime 比较 | 须在同环境测量：多实例并发 Claim 时边界秒级误判率；记录 NTP/容器时钟偏差上界（**待实测**） |
+| Claim 边界 | `nextRetryAt` 为空或 ≤ `serverNow`；可领取态 `leaseOwner=null` 且 `leaseExpiresAt=null`（06 §14.4.1） | EXP-01 |
+| Renew 边界 | `leaseExpiresAt > serverNow` 方可续期；**禁止**对已过期租约 Renew「复活」 | EXP-03（到期前/后对照） |
+| Reclaim 边界 | `status=processing` 且 `leaseExpiresAt <= serverNow` | EXP-03 |
+| 事务执行中租约到期 | 机制 A 步骤 1 含 `leaseExpiresAt > serverNow`；**若**事务始于合法租约、提交前租约已过期 | EXP-05（T4/T5 子组）+ EXP-07：**不得**假设允许提交 Task；预期 Fail-Closed（步骤 1 影响 0 或事务失败） |
+| 实验时间戳 | 屏障时间线、操作日志使用 **UTC ISO-8601**；同时记录各 Worker **本地** `Date.now()` 与所用 `serverNow` 来源字段 | §8.3 证据通用要求 |
+
+**禁止**：为通过实验而临时改写业务 Job 上的租约字段作为屏障；屏障不得参与被测 Claim/Reclaim/机制 A 事务（见 EXP-04）。
 
 ### 7.4 ARC-05.4 — 执行权与下游写入原子性（P0）
 
-**时序核心**（须 EXP-04 + EXP-05）：
+**时序核心**（须 EXP-04 + EXP-05 T1—T4/T6）：
 
 ```text
-Worker A1: 事务内 get Job 并校验旧 Session → 人为屏障暂停
-Worker B:   Reclaim + Claim 新 Session（事务外 CAS）
-Worker A1: 恢复并尝试提交 Task 写
+Worker A1: 机制 A 事务 → 在预定阶段暂停（见 EXP-04/05 暂停点）
+Worker B:   事务外 Reclaim + Claim 新 Session（独立调用）
+Worker A1: 恢复至 commit；与 B 竞争同一 Job doc
 ```
 
-**预期**：A1 不得成功写入 `schedule_tasks`；B 的执行权不被 A1 覆盖。
+**预期**：B 取得执行权后，A1 **不得**持久化 `schedule_tasks` 业务写入（**否则 ARC-05.4 = FAIL**）。T5 合法先后见 EXP-05。
 
 **须回答的分析题**（写入 §12 结论时逐条引用实验证据）：
 
@@ -225,8 +247,8 @@ Worker A1: 恢复并尝试提交 Task 写
 | 实验编号 | 名称 | 子任务 | 状态 | 结论 |
 | --- | --- | --- | --- | --- |
 | ARC-05-EXP-01 | 单 Job 并发双 Worker Claim | 05.2 | NOT STARTED | — |
-| ARC-05-EXP-02 | 同实例新旧 Claim Session 隔离 | 05.2 / 05.3 | NOT STARTED | — |
-| ARC-05-EXP-03 | 过期租约 Reclaim 与旧 Session 失效 | 05.2 / 05.3 | NOT STARTED | — |
+| ARC-05-EXP-02 | Claim Session 身份隔离（同实例 A1/A2） | 05.2 / 05.3 | NOT STARTED | — |
+| ARC-05-EXP-03 | Lease 生命周期、Reclaim 与重新 Claim | 05.2 / 05.3 | NOT STARTED | — |
 | ARC-05-EXP-04 | 旧 Worker 恢复后 ScheduleTask 写入防护 | 05.3 / **05.4** | NOT STARTED | — |
 | ARC-05-EXP-05 | 执行权验证与下游写入事务竞争 | **05.4** | NOT STARTED | — |
 | ARC-05-EXP-06 | 事务提交冲突与自动重试 | 05.1 | NOT STARTED | — |
@@ -236,72 +258,123 @@ Worker A1: 恢复并尝试提交 Task 写
 
 ### 8.2 实验详细设计
 
-#### ARC-05-EXP-01 — 单 Job 并发双 Worker Claim
+#### ARC-05-EXP-01 — 单 Job 并发双 Worker Claim（P0-03）
 
 | 项 | 内容 |
 | --- | --- |
-| 验证目标 | 并发 Claim 仅一个成功；失败者 `stats.updated=0` |
-| 前置条件 | 一条 `pending` Job；`leaseOwner=null` |
-| 测试数据 | 预置 `arc05_background_jobs` 文档 1 条 |
-| 并发参与者 | 云函数 `claimWorker` ×2（不同 `workerInstanceId`，不同预生成 `claimSessionId`） |
-| 执行步骤 | ① 屏障同步两路 `Promise` 同时 `where({_id,status:pending,leaseOwner:null}).update(...)` ② 采集双方 `stats.updated` 与 Job 终态 |
-| 预期结果 | 恰好一方 `updated=1`；Job 上 `leaseOwner`/`claimVersion` 与胜利方 Session 一致 |
-| 失败表现 | 双方 `updated=1` 或 Job 处于不一致字段组合 |
-| 证据采集 | Claim 前后 Job JSON、双方日志、时间戳、`stats` |
-| 通过标准 | 终态唯一有效 Session；`claimVersion` 仅递增 1 次 |
+| 验证目标 | 并发 Claim 仅一个成功；失败者 `stats.updated=0` 且 **不得**继续 ScheduleTask 写入；SDK 对条件更新、`_.inc(claimVersion)`、影响记录数的支持情况可观测 |
+| 前置条件 | 一条 `pending` Job：`claimVersion=0`，`nextRetryAt` 为空或 ≤ 实验用 `serverNow`（§7.5）；`leaseOwner=null`，`leaseExpiresAt=null` |
+| 测试数据 | 预置 `arc05_background_jobs` 文档 1 条（隔离集合） |
+| 并发参与者 | **两个独立云函数调用**（不同 `workerInstanceId`；各自在发起 CAS **前**生成不同 `claimSessionId`） |
+| CAS 条件字段（与 06 §14.4.1、02 §7.4.1 对齐，**不得**省略） | `_id=jobId`；`status=pending`；`nextRetryAt` 不存在或 ≤ `serverNow`；`leaseOwner=null`；`leaseExpiresAt=null` |
+| 原子更新字段（同一 `update`） | `status=processing`；`leaseOwner=<本次预生成 Claim Session ID>`；`workerInstanceId=<本实例 ID>`（仅诊断）；`leaseExpiresAt=serverNow+leaseDuration`；`claimVersion` **数据库原子** +1（如 `_.inc(1)`，**禁止**先 `get` 后在应用层 `+1` 并无条件写回）；`updatedAt=serverNow`（或 `db.serverDate()`，须在证据中注明与 §7.5 一致性） |
+| 执行步骤 | ① 外部**启动屏障**仅同步两路 Claim 发起时刻（屏障 **不**写 Job，见 EXP-04 协调通道原则）② 双方同时执行上述 CAS ③ 采集 `stats.updated` ④ 失败方 **必须**尝试一次下游写（机制 A 或占位调用）以验证其 **未**持有执行权 ⑤ 读 Job 终态 |
+| 预期结果 | 恰好一方 `updated=1`；胜方 `leaseOwner`/`claimVersion`/`workerInstanceId` 与其预生成 Session 一致；败方 `updated=0` 且下游写 **不得**成功 |
+| 失败表现 | 双方 `updated=1`；`claimVersion` 递增 ≠1；字段组合不一致（如 `processing` 但 `leaseOwner=null`） |
+| SDK 能力缺口 | 不支持 `_.inc`、不支持多条件 `where`、不返回 `stats.updated`、或无法在同一 API 完成条件+递增 → 记录为 **能力缺口**，**禁止**用应用层模拟原子 Claim 标 PASS |
+| 证据采集 | Claim 前后 Job JSON、双方 Session 预生成值、`stats`、失败方下游写结果、§7.5 时间源说明 |
+| 通过标准 | 02 §7.4.1 规则 3 + 06 §14.4.1 全文；终态唯一有效 Session；`claimVersion` 仅递增 1 次 |
+| API 待核实 | 实验编码前须对照当前锁定 `wx-server-sdk` 文档核对 `where().update()`、`command.inc` 形态；任务书阶段 **不**编造可运行代码 |
 
-#### ARC-05-EXP-02 — 同实例新旧 Claim Session 隔离
-
-| 项 | 内容 |
-| --- | --- |
-| 验证目标 | 同 `workerInstanceId` 下 A1 与 A2 Session 不可互认 |
-| 前置条件 | A1 已成功 Claim `version=1` |
-| 测试数据 | Job + 本地模拟 A1 持 `(sessionA1,1)` |
-| 并发参与者 | 单云函数实例逻辑分岔模拟 A1/A2 |
-| 执行步骤 | ① A1 Claim ② 人工将 `leaseExpiresAt` 设为过去（或等待）③ 回收 ④ **同 workerInstanceId** 生成 `sessionA2` 再 Claim ⑤ A1 用旧三元组尝试 Renew/写/Complete |
-| 预期结果 | A2 `version=2`；A1 全部写操作 `updated=0` 或事务失败 |
-| 失败表现 | A1 凭借相同 `workerInstanceId` 成功写 |
-| 证据采集 | 每步 Job 快照、A1/A2 操作日志 |
-| 通过标准 | 02 §7.4.1 规则 3 + 06 §14.4.1 步骤 7 |
-
-#### ARC-05-EXP-03 — 过期租约 Reclaim 与旧 Session 失效
+#### ARC-05-EXP-02 — Claim Session 身份隔离（P1-02，**非** Reclaim 主路径）
 
 | 项 | 内容 |
 | --- | --- |
-| 验证目标 | Reclaim 后 B 新 Session + 更高 version；A 旧 Session 失效 |
-| 前置条件 | A 持有 `processing` 且租约过期 |
-| 执行步骤 | ① Reclaim CAS ② B Claim ③ A 用旧 Session 续租/写/完成 |
-| 预期结果 | A 全部失败；B 持有唯一有效租约 |
-| 失败表现 | `claimVersion` 未递增或 A 仍成功 |
-| 证据采集 | Reclaim 前后 Job、`claimVersion` 序列 |
-| 通过标准 | 06 §14.4.3 + 02 §7.4.1 规则 5—6 |
+| 验证边界 | **仅**验证 Claim Session 身份与本地三元组不变性；**不**在此实验主路径验证「Lease 到期前能否 Reclaim」（属 EXP-03） |
+| 验证目标 | 同一 `workerInstanceId` 可先后产生 **不同** Claim Session；A1 与 A2 的 Session ID **必须**不同；A1 恢复后 **禁止**用 Job 上最新 `leaseOwner`/`claimVersion` 覆盖本地 `(jobId, sessionA1, v1)`；A1 用旧三元组不得 Renew / 机制 A 写 Task / Complete / Fail |
+| 前置条件 | A1 按 EXP-01 规则成功 Claim，`claimVersion=1`，`leaseOwner=sessionA1` |
+| 测试数据 | Job + A1 进程持久化三元组（**故意不**在恢复时重读 Job 刷新 token） |
+| 并发参与者 | 实例 A：协程/调用 A1（挂起）；实例 A 或 B：`sessionA2` 新 Claim（在 A1 租约已合法失效后，失效方式 **二选一**：等待 `leaseExpiresAt` 自然到期后由 **EXP-03 的 Reclaim** 置 `pending`，再 Claim；或实验编排仅调用 §14.4.1 Claim 于已 `pending` 的 Job） |
+| 执行步骤 | ① A1 Claim 并持有三元组 ② A1 **暂停**（不调 Renew）③ 使租约失效并完成 **一次** Reclaim+新 Claim（步骤细节引用 EXP-03，本实验只消费其终态：`sessionA2`/`v2` 在 Job 上）④ A1 恢复 ⑤ A1 **不得**执行「按 `_id` 读 Job 并采用新版本」⑥ A1 用 `(sessionA1,v1)` 尝试 Renew、机制 A、Complete ⑦ A2 用合法三元组对照执行一条 Renew 或只读外的合法操作 |
+| 预期结果 | Job 上为 `sessionA2`/`v2`；A1 全部 mutating 操作失败（`updated=0` 或事务 rollback）；A2 在合法三元组下 Renew 成功（若租约仍有效） |
+| 失败表现 | A1 因 `workerInstanceId` 相同而成功写或 Renew；A1 读 Job 后改用 `v2` 继续写 |
+| 证据采集 | A1 恢复前后 **本地**三元组日志、是否发生 Job 全字段重读、各操作 `stats`/事务结果 |
+| 通过标准 | 06 §14.4.1 步骤 7、同实例双会话行；02 §7.4.1 规则 3—4 |
+| 与 EXP-03 分界 | EXP-03 负责 Reclaim CAS 正确性、到期前后 Reclaim、并发回收；本实验 **不**重复验收 Reclaim 字段清理 |
 
-#### ARC-05-EXP-04 — 旧 Worker 恢复后 ScheduleTask 写入防护（可控时序）
-
-| 项 | 内容 |
-| --- | --- |
-| 验证目标 | P0：A1 暂停恢复后不得写入 Task |
-| 前置条件 | A1 已 Claim；`schedule_tasks` 测试 doc 存在 |
-| 并发参与者 | A1 事务协程 + B Reclaim 协程 |
-| 执行步骤 | ① A1 进入 `runTransaction`，`get` Job 校验通过后 **await 屏障**（Redis/DB 标志位/共享文件 — 验证环境自选）② B Reclaim + Claim ③ 释放屏障 ④ A1 继续写 Job touch + Task update ⑤ 查询 Task 终态 |
-| 预期结果 | 事务 reject/rollback；Task 无 A1 写入或保持 B 写入前状态 |
-| 失败表现 | Task 含 A1 会话对应写入且 B 已占有 Job |
-| 证据采集 | 事务 Promise 结果、Task 终态、操作时间线 |
-| 通过标准 | **数据库终态**不违反 06 §14.4.4 |
-
-**实现说明**：屏障须真并发，禁止顺序 `await` 模拟。
-
-#### ARC-05-EXP-05 — Job 执行权验证与下游写入事务竞争（P0）
+#### ARC-05-EXP-03 — Lease 生命周期与 Reclaim（P1-02，**非**会话读覆盖场景）
 
 | 项 | 内容 |
 | --- | --- |
-| 验证目标 | 机制 A 是否在官方事务下满足原子边界 |
-| 前置条件 | 同 EXP-04；额外记录 B 成功写入路径对照组 |
-| 执行步骤 | 矩阵：**{事务内是否 touch Job} × {B Reclaim 时点}**；至少 4 组 |
-| 预期结果 | 旧 Session 路径 Task 不写；新 Session 路径在合法三元组下可写 |
-| 失败表现 | Job 属 B 而 Task 被 A1 改 |
-| 证据采集 | 每组 Job + Task + 事务错误码 |
-| 通过标准 | ARC-05.4 表「通过标准」 |
+| 验证边界 | **仅**验证租约时效、Reclaim、重新 Claim 与并发回收；**不**重复 EXP-02 的「A1 禁止读 Job 刷新 token」主验收（EXP-02 已覆盖） |
+| 验证目标 | 租约 **未**到期时 Reclaim **必须**失败；到期后 Reclaim 成功并清理 `leaseOwner`/`workerInstanceId`/`leaseExpiresAt`，**不**改 `claimVersion`；新 Claim 产生新 Session 且 `claimVersion+1`；多 Reclaim Worker 仅一个成功；Reclaim 与后续 Claim 之间 Job 不得长时间处于非法组合态 |
+| 前置条件 | 子用例 3a：A 持有 `processing`，`leaseExpiresAt > serverNow`；3b：同 Job，`leaseExpiresAt <= serverNow` |
+| Reclaim CAS（06 §14.4.3） | 条件：`status=processing`，`leaseExpiresAt <= serverNow`；更新：`pending`（可含 `nextRetryAt`），租约字段清空，**不**修改 `claimVersion` |
+| 执行步骤 | ① **3a** 到期前发起 Reclaim → 预期 `updated=0` ② **3b** 到期后 Reclaim → `updated=1`，核验字段清理与 `claimVersion` 不变 ③ B 按 §14.4.1 Claim → `claimVersion` 递增、新 `leaseOwner` ④ 可选：两回收 Worker 并发 Reclaim（仅一处成功）⑤ 旧 Session A 对 Reclaim/Claim 路径做一次 mutating 尝试（预期失败，**轻量**，不断言读覆盖——详见 EXP-02） |
+| 预期结果 | 3a 失败；3b 成功后 B 唯一有效租约；`claimVersion` 序列：回收前后不变，Claim 后 +1 |
+| 失败表现 | 到期前回收成功；回收改动 `claimVersion`；双回收均成功；Claim 后仍存在双执行权 |
+| 证据采集 | 各步 `serverNow` 与 `leaseExpiresAt` 对照、Job 快照、`stats.updated` |
+| 通过标准 | 06 §14.4.3 + 02 §7.4.1 规则 5—6、规则 8 |
+
+#### ARC-05-EXP-04 — 旧 Worker 恢复后 ScheduleTask 写入防护（P0-01，可控时序）
+
+| 项 | 内容 |
+| --- | --- |
+| 验证目标 | P0：在 B 已完成 Reclaim + 新 Claim 后，A1 恢复并提交机制 A **不得**成功写入 `schedule_tasks`；屏障本身不得污染被测事务能力结论 |
+| 前置条件 | A1 已 Claim 且本地三元组合法；`arc05_schedule_tasks` 测试 doc 存在；B 为独立 Worker 调用 |
+| 并发参与者 | **真实并发**：云函数调用 #1（A1，`runTransaction` 或 `startTransaction`）+ 云函数调用 #2（B，事务外 CAS）+ **测试控制器**（第三类进程，见下） |
+
+**屏障与协调（P0-01，必守）**
+
+| 原则 | 要求 |
+| --- | --- |
+| 不参与被测事务 | 屏障 **仅**协调测试 Worker 时序；**禁止**在屏障通道或协调集合中执行 Claim、Reclaim、机制 A 步骤 1/2、或修改被测 Job 的业务字段 |
+| 独立协调通道（优先序） | ① 专用 **HTTP 测试控制器**（内存/文件状态，不连被测库写 Job）② 独立 **Redis / 消息**（key 与 `arc05_*` Job 无关）③ **禁止**使用对被测 `arc05_background_jobs` 的「标志位 update」作为屏障（会干扰 CAS/事务锁） |
+| A1 暂停点 | 机制 A 事务回调内：**已完成** `doc(jobId).get` 且应用层校验旧 Session 通过；**尚未** touch Job（步骤 1 写）；**尚未**写 Task |
+| A1 → 控制器 | 暂停点后调用协调 API：`POST /barrier/reached {experimentId, role:A1, phase:TX_AFTER_READ}`；阻塞直至 `phase:RESUME_A1` 或超时 |
+| B 路径 | 控制器在收到 `TX_AFTER_READ` 后 **才**触发 B：Reclaim（若需）+ §14.4.1 Claim；完成后 `POST /barrier/b_done {newSession,newVersion}` → 控制器下发 `RESUME_A1` |
+| 时间线证据 | 须记录 ISO 时间：`t_a1_pause`、`t_b_reclaim_done`、`t_b_claim_done`、`t_a1_resume`、`t_tx_settle` |
+| 超时与退出 | 屏障等待上限建议 `barrierTimeoutMs`（如 120000，< 云函数硬超时）；超时 → 本 **run 标为 INVALID**（非事务 PASS）；强制结束挂起事务/调用 |
+| 真并发 | A1 与 B **必须**为并行调用；**禁止**单进程 `await B(); await A1继续()` 顺序模拟 |
+| 屏障失败 | 协调 API 不可用、死锁、超时 → 实验 **INVALID 或 FAIL**；**不得**解释为「微信事务能力通过」 |
+
+| 执行步骤 | ① 控制器 reset ② 并行启动 A1 事务与 B「待命」③ A1 到达暂停点并通知控制器 ④ B 执行 Reclaim+Claim 并通知 ⑤ 控制器恢复 A1 ⑥ A1 执行 touch Job + Task update 并 commit ⑦ 只读查询 Job + Task 终态 |
+| 预期结果 | A1 事务 rollback/reject 或提交后 Task **无** A1 侧业务写入；Job 属 B 的新 Session |
+| 失败表现 | B 已占有 Job 后 Task 仍出现 A1 写入（→ **ARC-05.4 必须 FAIL**） |
+| 证据采集 | 屏障事件日志、事务结果（含 `runTransaction` 重试次数）、Job/Task 终态、§7.5 时间戳 |
+| 通过标准 | **数据库终态**满足 06 §14.4.4；屏障 INVALID 的 run **不计入** PASS 样本 |
+
+#### ARC-05-EXP-05 — 执行权与下游写入事务竞争矩阵（P0-02）
+
+| 项 | 内容 |
+| --- | --- |
+| 验证目标 | 区分旧 Worker 在事务内 **四阶段**（仅读 Job → 条件语义校验 → touch Job 写 → 写 Task / 提交）与 B 的 Reclaim+Claim 竞态；判定机制 A 是否满足 06 §14.4.4 |
+| 前置条件 | 每组独立 Job+Task；屏障协议同 EXP-04（可复用控制器） |
+| SDK 重试（须与 EXP-06 交叉） | `runTransaction` 冲突时平台可能 **重试回调**；须记录回调执行次数。重入后 **是否**重新 `get` Job、是否仍用 **本地** `(sessionA1,v1)` 校验 — **须实测**，**不得**将「回调曾成功返回」等同于「事务已 commit」 |
+| 禁止项 | 事务外二次校验作为 fencing；事务回调成功 ≠ 提交成功；心跳推断旧 Worker 停止 |
+
+**竞争矩阵 T1—T6（每组须独立跑、独立证据 ID）**
+
+| 场景 | A1 事务内阶段（暂停点） | B 执行 | 重点验证 | 预期事务行为（旧 Session A1） | Job 终态 | ScheduleTask 终态 | PASS 证据 | FAIL / PARTIAL |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **T1** | **尚未** `get` Job | Reclaim+Claim 完成 | A1 起始前执行权已属 B | 回调内校验失败或事务 abort；**不得**写 Task | `processing`，`leaseOwner=B`，`claimVersion` 已递增 | 无 A1 写入 | Task 无 A1 字段；事务拒绝日志 | A1 仍写 Task → **ARC-05.4 FAIL** |
+| **T2** | 已 `get`+校验，**未** touch | B 完成 | 旧快照是否仍提交 | 提交时应与 B 争用锁/版本；步骤 1 失败或整体 rollback | B 占有 | 无 A1 业务写 | 同左 | Job 属 B 且 Task 被 A1 改 → **FAIL** |
+| **T3** | 已 touch Job，**未**写 Task | B 完成 | 冲突检测 | 整笔 rollback 或 commit 不含 Task 写 | B 占有 | 无 A1 写 | touch 未导致 A1 Task 落库 | 任 A1 Task 落库 → **FAIL** |
+| **T4** | 已写 Task，**未** commit | B 完成 | 阻止旧 Task 落库 | **必须**整笔失败或 Task 变更不可见 | B 占有 | B 路径对照可写；无 A1 写 | 终态只读 | A1 Task 可见 → **FAIL** |
+| **T5** | A1 **完整 commit** 成功 | **随后** B Reclaim+Claim | 合法先后：A1 先完成 | A1 commit 在 B 前时 Task **可**含 A1（合法）；B 之后不得覆盖为「越权」误判 | 视 B 是否回收：可能 `pending`→B 占有 | A1 写入若先于 B 领取则保留 | 时间线证明 `t_a1_commit < t_b_claim` | 将 T5 时间序颠倒解读为 FAIL |
+| **T6** | A1 提交结果 **unknown**（断点见 EXP-07） | B 完成 | 能否识别已提交 Task | **不得**盲目重试写；只读 Job+Task 后 Fail-Closed | B 占有 | 以持久化为准 | 恢复决策表（EXP-07）一致 | 未知时重复写导致双写 → **FAIL** |
+
+**每组通用输入记录**
+
+- 初始 Job：`status`、`claimVersion`、租约字段
+- A1 本地 `(jobId, claimSessionId, claimVersion)`
+- B 的 Reclaim 条件是否满足、新 Session、`claimVersion` 递增后值
+- 暂停点 phase 名（与 EXP-04 枚举对齐）
+- 事务 settle 结果：**committed / rolled_back / unknown**（三者分列，禁止混称）
+
+**执行步骤（每组）**
+
+1. 按场景设置 A1 暂停点
+2. B 完成 Reclaim+Claim
+3. 恢复 A1 完成剩余阶段至 commit/unknown
+4. 只读 Job + Task；对照上表判定
+5. 记录 `runTransaction` 回调次数与最终错误码
+
+**ARC-05.4 硬性 FAIL 门槛（P0-02-5）**：若 **B 已成功取得新执行权** 后，A1 仍能使 **ScheduleTask 业务写入持久化成功**，则 ARC-05.4 = **FAIL**，与 T 编号无关。
+
+**对照组**：新 Session B 在合法三元组下机制 A 成功写 Task（证明非环境性假阴性）。
+
+**通过标准**：T1—T4、T6 均满足「B 占有后无 A1 Task 写」；T5 时间序符合语义；未知提交走 Fail-Closed。
 
 #### ARC-05-EXP-06 — 事务提交冲突与自动重试
 
@@ -312,14 +385,48 @@ Worker A1: 恢复并尝试提交 Task 写
 | 预期结果 | 与官方「默认 3 次」一致或可观测偏差（偏差须记录） |
 | 通过标准 | 行为可预测且可日志化 |
 
-#### ARC-05-EXP-07 — 事务超时、网络中断、提交结果未知
+#### ARC-05-EXP-07 — 事务失败、超时与提交结果未知（P1-03）
 
 | 项 | 内容 |
 | --- | --- |
-| 验证目标 | 调用方能否判定 commit 成败；Fail-Closed 恢复策略输入 |
-| 执行步骤 | ① 人为延长屏障 > `cloud.init.timeout` ② 模拟中断（kill / 抛错点对照）③ 只读重查 Job + Task |
-| 预期结果 | 文档化「已知/未知」集合 |
-| 通过标准 | 对 06 Fail-Closed「能力支持但本次事务失败」行给出可操作恢复表 |
+| 验证目标 | 调用方能否判定 commit 成败；为 06 §14.4.4 Fail-Closed「能力支持但本次事务失败」与 §14.4.7「事务提交结果未知」提供 **可执行** 恢复输入；与 EXP-05 **T6** 衔接 |
+
+**须覆盖场景（独立 run，标注断点）**
+
+| # | 场景 | 断点/手法 | 观测 |
+| --- | --- | --- | --- |
+| 7.1 | 事务开始前网络/API 不可用 | 未进入 `runTransaction` | 无 Job/Task 变更；Worker 不得假设已写 |
+| 7.2 | 事务执行中网络中断 | `get` 后/touch 前/touch 后注入失败 | 事务状态 + 终态只读 |
+| 7.3 | commit **前**客户端异常退出 | `startTransaction` + 未 `commit` 进程结束 | Job/Task 是否变更 |
+| 7.4 | commit 已发出、响应前超时 | 代理延迟/丢弃响应 | **unknown** |
+| 7.5 | 服务端已 commit、客户端未收到成功 | 对照 7.4 只读 | 可能 known-commit |
+| 7.6 | 服务端失败、客户端无法确认 | 同上 | unknown vs fail |
+| 7.7 | SDK 自动重试导致回调重复 | 与 EXP-06 同 run 记录 | 回调次数、是否双写 Task |
+| 7.8 | Worker 恢复后只读 Job + ScheduleTask | 应用恢复决策表 | 是否 Fail-Closed |
+
+**恢复决策表（实验结论须回填此表可操作性，不得留空臆断）**
+
+| 观测结果（持久化 + 执行权） | 是否允许重试事务 | 是否允许继续 ScheduleTask 写入 | 恢复动作 |
+| --- | --- | --- | --- |
+| Task **无** 本次业务写；Job 仍属本 Session 且租约有效 | 是（新事务） | 是（须机制 A） | 在确认三元组后重试 |
+| Task **已有** 本次幂等键对应写；Job 仍 processing | 否（避免双写） | 否 | 按幂等视为完成或进入完成 Job 路径 |
+| Task 不确定；Job 仍属本 Session | **否** | **否** | **Fail-Closed**：只读、告警、人工或编排查询 |
+| Task 不确定；Job 已属 **新** Session | **否** | **否** | 旧 Worker **退出**；禁止用新 token 写 |
+| 事务 **unknown**；未确认 Task | **否** | **否** | **Fail-Closed**；禁止假设回滚 |
+| 事务 **unknown**；Task 已存在业务写 | 否 | 否 | 以 Task 为准收敛；禁止盲目重试写 |
+| 平台返回明确 rollback | 是（若仍持执行权） | 视执行权 | 记录错误码；重试前再 CAS/只读 |
+| ARC-05 能力未 PASS | 否 | **否** | 06「能力尚未验证」 |
+
+**必守原则（P1-03）**
+
+- 结果 unknown 时 **不得**假设事务失败；**不得**直接重复非幂等业务写入
+- **必须**先以 Job + Task **持久化终态**确认；无法确认 → Fail-Closed
+- **不得**仅凭客户端异常、超时、本地日志断定已 rollback
+
+| 执行步骤 | 按上表 # 逐场景执行；必要时 `startTransaction` 控制 commit 时点；每场景后只读双集合 |
+| 预期结果 | 明确「平台可判定 / 不可判定」集合；决策表每行有实测依据或标 **官方未说明** |
+| 证据采集 | 事务 API 返回值、云函数日志、**数据库终态**、是否发生 EXP-05 T6 型双写 |
+| 通过标准 | 决策表可指导 Worker 实现且符合 06 Fail-Closed；**不**代表平台能力 PASS |
 
 #### ARC-05-EXP-08 — 重复投递、重复执行、幂等
 
@@ -341,11 +448,12 @@ Worker A1: 恢复并尝试提交 Task 写
 
 除接口返回值外，**必须**采集：
 
-- Claim 前后 Job 全字段（至少：`status`、`leaseOwner`、`claimVersion`、`workerInstanceId`、`leaseExpiresAt`）
-- 每次事务 commit/rollback 结果与重试次数
+- Claim 前后 Job 全字段（至少：`status`、`leaseOwner`、`claimVersion`、`workerInstanceId`、`leaseExpiresAt`、`nextRetryAt`）
+- 每次事务 **committed / rolled_back / unknown** 分列记录；`runTransaction` **回调执行次数**（非单次回调返回即 commit）
 - `schedule_tasks` 终态
-- 结构化操作日志（操作者、Session、version、ISO 时间）
-- **以数据库终态**判定是否违反安全约束
+- 结构化操作日志（操作者、Session、version、**serverNow 来源**、UTC ISO 时间、屏障 phase）
+- EXP-04/05：**屏障事件时间线**（与 §8.2 EXP-04 枚举一致）
+- **以数据库终态**判定是否违反安全约束；屏障 INVALID 的 run 单独标注，不计入 PASS 统计
 
 ---
 
@@ -457,10 +565,12 @@ ARC-05.4 为门禁项；未通过则：
 
 | 优先级 | 问题 | 原因 | 下一步证据 |
 | --- | --- | --- | --- |
-| **P0** | 快照隔离 + 无 `where` 事务 CAS 能否满足 §14.4.4 | 官方明确非串行化且不能避免 write skew | EXP-04、EXP-05 |
-| **P0** | 旧 Worker 事务在 Reclaim 后是否仍可提交 Task | 官方未等价保证 | EXP-04、EXP-05 |
-| **P1** | 事务超时与 commit 未知 | 官方未说明 | EXP-07 |
-| **P1** | Claim CAS 与事务内校验的组合是否构成隐藏 check-then-write | 架构歧义 | EXP-05 评审记录 |
+| **P0** | 快照隔离 + 无 `where` 事务 CAS 能否满足 §14.4.4 | 官方明确非串行化且不能避免 write skew | EXP-04、EXP-05 T1—T4 |
+| **P0** | 旧 Worker 事务在 Reclaim 后是否仍可提交 Task | 官方未等价保证；**若发生 → ARC-05.4 FAIL** | EXP-04、EXP-05 |
+| **P1** | 可读 `serverNow` 与 `serverDate` 一致性 | 02 要求服务端时钟权威；微信能力 **待实测** | §7.5、EXP-01/03 |
+| **P1** | 事务超时与 commit 未知 | 官方未说明 | EXP-07、EXP-05 T6 |
+| **P1** | Claim CAS 与事务内校验的组合是否构成隐藏 check-then-write | 架构歧义；机制 A 步骤须在事务内 touch | EXP-05 评审记录 |
+| **P1** | 实验屏障可靠性与真并发 | 屏障失败不得误判平台 PASS | EXP-04 协调规范 |
 | **P2** | TransactionBusy 类错误频率（社区个案） | 非官方 SLA | EXP-09 |
 | **P2** | 工程 ARC-02 环境/SDK 版本未锁定 | §4 待填 | 工程初始化 |
 
@@ -471,21 +581,21 @@ ARC-05.4 为门禁项；未通过则：
 | 版本 | 日期 | 说明 |
 | --- | --- | --- |
 | 0.1 | 2026-11-09 | 初版任务书；状态 NOT STARTED；含官方桌面调研与实验设计 |
+| 0.2 | 2026-11-09 | **ARC-05.1 定点修订**：强化 EXP-04 屏障独立性/真并发；EXP-05 T1—T6 矩阵；EXP-01 与 02/06 Claim 对齐；§7.5 时间源；拆分 EXP-02/03 边界；细化 EXP-07 恢复决策表。**未执行**平台实验；子任务结论仍为 NOT STARTED |
 
 ---
 
-## 附录 A — 执行前上下文检查（任务书编写时）
+## 附录 A — 执行前上下文检查
 
 | 检查项 | 结果 | 说明 |
 | --- | --- | --- |
-| 当前分支和最新提交 | main / `39bbd5b` | `docs(spec): F-04.3.3 终校 07 追踪...` |
-| 02 数据模型阅读 | 完成 | §7.4.1 BackgroundJob、Claim Session、`claimVersion`、索引/CAS 要求 |
-| 06 技术架构阅读 | 完成 | §14.3—§14.4.7、机制 A/B、Fail-Closed |
-| 07 审查报告阅读 | 完成 | §15.7 F-04.3.2-02、§15.8 F-04.3.3、ARC-05 待验证清单 |
-| PRD 阅读 | 完成（节选） | 技术方向：小程序 + 云开发 |
-| `specs/00-project-charter.md` | 不存在 | 已记录 |
-| `docs/agent/STATUS.md` | 不存在 | 已记录 |
-| 是否存在 ARC-05 文档 | 否 → **本文件新建** | |
-| 工作区未提交修改 | 无 | `git status` clean |
-| 与 ARC-05 新 Spec 冲突 | 未发现 | 06 已预留 ARC-05 与 Fail-Closed；无矛盾 |
-| `specs/phases/` 目录 | 不存在 → 随本文创建 | 与 07 NEEDS_TECH_VALIDATION 口径一致 |
+| 当前分支和最新提交 | main，与 `origin/main` 同步 | 2026-11-09 修订前 `git status` clean |
+| 02 数据模型阅读 | 完成 | §7.4.1 Claim Session、`claimVersion`、租约 CAS |
+| 06 技术架构阅读 | 完成 | §14.4.1—§14.4.7、机制 A/B、Fail-Closed、`serverNow` |
+| 07 审查报告阅读 | 完成 | `specs/07-spec-consistency-review.md` §15.7—§15.8 调度/执行权/ARC-05 待验证 |
+| `specs/00-project-charter.md` | **不存在** | 已记录，未编造 |
+| `docs/agent/STATUS.md` | **不存在** | 已记录，未编造 |
+| `package.json` / npm scripts | **不存在** | 仓库根目录无 `package.json`；不假设测试命令 |
+| ARC-05 版本/状态 | 0.2 / 整体 **NOT STARTED** | EXP-01—EXP-09 结论栏仍为 NOT STARTED |
+| 本轮授权修改 | `specs/phases/ARC-05-platform-capability-validation.md` | ARC-05.1 实验设计修订 |
+| 与 02/06 冲突 | 未发现新增冲突 | 修订以 02 §7.4.1、06 §14.4 为准；Barrier 禁止写 Job |
